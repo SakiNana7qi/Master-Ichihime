@@ -8,6 +8,7 @@
 
 1. **麻将算点器** (`mahjong_scorer/`) - 完整的日本立直麻将规则引擎
 2. **麻将环境** (`mahjong_environment/`) - 基于Gymnasium的多智能体强化学习环境
+3. **麻将AI Agent** (`mahjong_agent/`) - 基于PPO算法的强化学习AI 🆕
 
 ## 项目结构
 
@@ -37,17 +38,88 @@ Master-Ichihime/
 │   ├── example_random_agent.py # 随机智能体示例
 │   └── README.md               # 环境文档
 │
-├── README_SCORER.md             # 算点器详细文档
-└── README.md                    # 本文件
+├── mahjong_agent/               # 麻将AI Agent 🆕
+│   ├── model.py                # Actor-Critic神经网络
+│   ├── rollout_buffer.py       # 经验缓冲区
+│   ├── ppo_updater.py          # PPO算法更新器
+│   ├── train.py                # 训练脚本
+│   ├── evaluate.py             # 评估脚本
+│   ├── config.py               # 配置文件
+│   └── README.md               # Agent文档
+│
+├── quickstart_agent.py          # Agent快速入门 🆕
+├── AGENT_GUIDE.md              # Agent完整指南 🆕
+├── README_SCORER.md            # 算点器详细文档
+└── README.md                   # 本文件
 ```
 
 ## 快速开始
 
-### 1. 安装依赖
+### 🚀 立即开始训练AI
 
+**最快的方式 - 使用快速入门脚本:**
+
+```bash
+# 交互式菜单，包含模型演示、环境交互、训练等
+python quickstart_agent.py
+```
+
+**或者直接开始训练:**
+
+```bash
+# Windows
+train_quickstart.bat
+
+# Linux/Mac
+chmod +x train_quickstart.sh
+./train_quickstart.sh
+```
+
+### 📦 安装依赖
+
+#### 基础依赖（算点器 + 环境）
 ```bash
 pip install numpy gymnasium
 ```
+
+#### AI Agent依赖（训练AI需要）
+```bash
+pip install torch tensorboard tqdm matplotlib
+# 或直接安装所有依赖
+pip install -r mahjong_agent/requirements.txt
+```
+
+### 🤖 训练和评估AI
+
+#### 快速训练（用于测试）
+```bash
+python -m mahjong_agent.train --config fast --device cuda
+```
+
+#### 标准训练（推荐）
+```bash
+python -m mahjong_agent.train --config default --device cuda --seed 42
+```
+
+#### 评估模型
+```bash
+# 评估训练好的模型
+python -m mahjong_agent.evaluate --model checkpoints/final_model.pt --episodes 100
+
+# 交互式演示
+python -m mahjong_agent.evaluate --model checkpoints/final_model.pt --interactive
+```
+
+#### 监控训练
+```bash
+# 启动TensorBoard查看训练曲线
+tensorboard --logdir logs/
+```
+
+#### 完整教程
+查看 [AGENT_GUIDE.md](AGENT_GUIDE.md) 获取详细的训练指南、配置说明和最佳实践。
+
+---
 
 ### 2. 使用算点器
 

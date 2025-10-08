@@ -53,5 +53,15 @@ checkpoints/
 logs/
 runs/
 models/
+*.pt
 *.pth
+*.ckpt
 *.pkl
+evaluation_report.txt
+my_report.txt
+
+# TensorBoard
+events.out.tfevents.*
+
+# 杂项
+/杂项
