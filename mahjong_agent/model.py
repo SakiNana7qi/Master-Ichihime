@@ -346,11 +346,8 @@ class MahjongActorCritic(nn.Module):
         log_prob = dist.log_prob(action)
         entropy = dist.entropy()
 
-        # 确保value是标量 - 彻底修复
-        if value.numel() > 1:
-            value = value.flatten()[0]  # 取第一个元素
-        elif value.dim() > 0:
-            value = value.squeeze()
+        # 保持批量维度：(batch,)
+        value = value.squeeze(-1)
 
         return action, log_prob, entropy, value
 
@@ -365,12 +362,8 @@ class MahjongActorCritic(nn.Module):
             value: 状态价值 (batch,)
         """
         _, value = self.forward(obs)
-        # 确保value是标量 - 彻底修复
-        if value.numel() > 1:
-            value = value.flatten()[0]  # 取第一个元素
-        elif value.dim() > 0:
-            value = value.squeeze()
-        return value
+        # 返回形状：(batch,)
+        return value.squeeze(-1)
 
 
 def convert_numpy_obs_to_torch(

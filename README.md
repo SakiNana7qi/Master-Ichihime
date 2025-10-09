@@ -101,6 +101,15 @@ python -m mahjong_agent.train --config fast --device cuda
 python -m mahjong_agent.train --config default --device cuda --seed 42
 ```
 
+#### 并行高吞吐训练（多线程/多环境）
+```bash
+# 预设将启用多环境与多线程（可在 AGENT_GUIDE.md 中查看细节）
+python -m mahjong_agent.train --config multithread --device cuda
+
+# PowerShell 可选设置（建议与 CPU 线程数一致）
+$env:OMP_NUM_THREADS="32"; $env:MKL_NUM_THREADS="32"
+```
+
 #### 评估模型
 ```bash
 # 评估训练好的模型

@@ -73,7 +73,10 @@ class MonitorWindow(QtWidgets.QMainWindow):
         plots_layout = QtWidgets.QGridLayout(plots_container)
         layout.addWidget(plots_container)
 
+        # 使用白底主题
         pg.setConfigOptions(antialias=True)
+        pg.setConfigOption("background", "w")
+        pg.setConfigOption("foreground", "k")
 
         # 训练曲线：回报、策略损失、价值损失、熵、KL
         self.plot_widgets: Dict[str, pg.PlotWidget] = {}
@@ -117,8 +120,9 @@ class MonitorWindow(QtWidgets.QMainWindow):
 
         # 曲线对象
         self.curves: Dict[str, pg.PlotDataItem] = {}
+        red_pen = pg.mkPen(color=(200, 0, 0), width=2)
         for key in self.plot_widgets:
-            self.curves[key] = self.plot_widgets[key].plot(pen=pg.mkPen(width=2))
+            self.curves[key] = self.plot_widgets[key].plot(pen=red_pen)
 
     def closeEvent(self, event):
         try:

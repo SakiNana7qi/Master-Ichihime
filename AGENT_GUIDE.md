@@ -49,6 +49,33 @@ pip install -r mahjong_agent/requirements.txt
 python -m mahjong_agent.train --config fast --device cuda
 ```
 
+#### 并行高吞吐（多线程/多环境）
+
+推荐给多核CPU + 单GPU的机器。使用预设：
+
+```python
+from mahjong_agent import MahjongTrainer
+from mahjong_agent.config_multithread import get_multithread_config
+
+config = get_multithread_config()
+
+# 可按机器调整：
+config.num_envs = 8        # 并行环境数（4~16）
+config.num_threads = 32    # CPU线程数（24~48）
+config.rollout_steps = 4096
+config.mini_batch_size = 1024
+config.device = "cuda"
+
+trainer = MahjongTrainer(config=config)
+trainer.train()
+```
+
+PowerShell下可设置线程环境变量（可选）：
+
+```powershell
+$env:OMP_NUM_THREADS="32"; $env:MKL_NUM_THREADS="32"
+```
+
 ---
 
 ## 📚 详细教程
@@ -125,6 +152,16 @@ tensorboard --logdir logs/
 # 在浏览器中打开
 # http://localhost:6006
 ```
+
+#### 桌面GUI（PyQt5）
+
+实时查看白底红线训练曲线：
+
+```bash
+python -m mahjong_agent.gui_monitor --log logs/realtime_metrics.jsonl
+```
+
+展示指标：平均回报、策略损失、价值损失、熵、KL、学习率、裁剪范围、评估胜率、FPS。
 
 #### 主要监控指标
 

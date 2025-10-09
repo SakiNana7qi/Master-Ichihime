@@ -19,6 +19,7 @@ project_root = Path(__file__).parent.parent
 sys.path.insert(0, str(project_root))
 
 from mahjong_environment import MahjongEnv
+from mahjong_agent.vec_env import SubprocVecEnv
 from mahjong_agent.model import MahjongActorCritic
 from mahjong_agent.rollout_buffer import RolloutBuffer
 from mahjong_agent.ppo_updater import PPOUpdater
@@ -54,14 +55,22 @@ class MahjongTrainer:
         # 设置随机种子
         self._set_seed(self.config.seed)
 
-        # 创建环境
-        self.env = MahjongEnv(
-            render_mode="human" if self.config.render_training else None,
-            seed=self.config.seed,
-        )
+        # 创建环境（支持并行）
+        self.num_envs = max(1, getattr(self.config, "num_envs", 1))
+        if self.num_envs == 1:
+            self.env = MahjongEnv(
+                render_mode="human" if self.config.render_training else None,
+                seed=self.config.seed,
+            )
+            self.vec_env = None
+        else:
+            # 多进程环境（仅用于数据采样阶段）
+            self.vec_env = SubprocVecEnv(self.num_envs, base_seed=self.config.seed)
+            self.env = None
 
         # 创建模型
         self.model = MahjongActorCritic(self.config).to(self.device)
+        torch.set_num_threads(getattr(self.config, "num_threads", os.cpu_count() or 1))
         print(f"模型参数量: {sum(p.numel() for p in self.model.parameters()):,}")
 
         # 创建PPO更新器
@@ -125,12 +134,18 @@ class MahjongTrainer:
         current_episode_length = 0
 
         # 重置环境
-        obs, info = self.env.reset(seed=self.config.seed + self.global_step)
+        if self.vec_env is not None:
+            obs_list, current_agents = self.vec_env.reset()
+            # 为所有子环境初始化episode统计
+            epi_rewards = [0.0 for _ in range(self.num_envs)]
+            epi_lengths = [0 for _ in range(self.num_envs)]
+        else:
+            obs, info = self.env.reset(seed=self.config.seed + self.global_step)
 
         # 收集rollout_steps步的数据
         for step in range(self.config.rollout_steps):
             # 检查游戏是否结束
-            if self.env.agent_selection is None:
+            if self.vec_env is None and self.env.agent_selection is None:
                 # 保存episode统计
                 episode_rewards.append(current_episode_reward)
                 episode_lengths.append(current_episode_length)
@@ -141,41 +156,102 @@ class MahjongTrainer:
                 current_episode_length = 0
                 self.episode_count += 1
 
-            # 获取当前玩家
-            current_agent = self.env.agent_selection
+            if self.vec_env is not None:
+                # 并行分支：构造批次推理，并将每个子环境样本写入buffer
+                import numpy as _np
 
-            # 获取观测和动作掩码
-            action_mask = obs["action_mask"]
+                action_masks = []
+                torch_obs_batch = {}
+                for i in range(self.num_envs):
+                    o = obs_list[i]
+                    action_masks.append(o["action_mask"])
+                    tobs = self._numpy_obs_to_torch(o)
+                    for k, v in tobs.items():
+                        torch_obs_batch.setdefault(k, []).append(v)
+                for k in torch_obs_batch:
+                    torch_obs_batch[k] = torch.cat(torch_obs_batch[k], dim=0)
+                torch_action_mask = torch.from_numpy(
+                    _np.stack(action_masks, axis=0)
+                ).to(self.device)
 
-            # 转换观测为torch格式
-            torch_obs = self._numpy_obs_to_torch(obs)
-            torch_action_mask = (
-                torch.from_numpy(action_mask).unsqueeze(0).to(self.device)
-            )
+                with torch.no_grad():
+                    actions_t, log_probs_t, _, values_t = (
+                        self.model.get_action_and_value(
+                            torch_obs_batch, action_mask=torch_action_mask
+                        )
+                    )
+                actions = actions_t.cpu().numpy()  # (N,)
+                log_probs = log_probs_t.cpu().numpy()  # (N,)
+                values = values_t.detach().cpu().numpy()  # (N,)
 
-            # 选择动作
-            with torch.no_grad():
-                action, log_prob, _, value = self.model.get_action_and_value(
-                    torch_obs, action_mask=torch_action_mask
+                # 步进所有环境
+                results = self.vec_env.step([int(a) for a in actions])
+
+                # 写入buffer并准备下一步观测
+                new_obs_list = []
+                for i, (next_obs, next_agent, reward, done, next_mask) in enumerate(
+                    results
+                ):
+                    # 写入当前样本
+                    vi = float(values[i] if values.ndim > 0 else values)
+                    li = float(log_probs[i] if log_probs.ndim > 0 else log_probs)
+                    ai = int(actions[i] if actions.ndim > 0 else actions)
+                    self.rollout_buffer.add(
+                        obs=obs_list[i],
+                        action=ai,
+                        log_prob=li,
+                        reward=float(reward),
+                        value=vi,
+                        done=bool(done),
+                        action_mask=action_masks[i],
+                    )
+                    # 统计
+                    epi_rewards[i] += float(reward)
+                    epi_lengths[i] += 1
+
+                    # 处理终局重置
+                    if next_obs is None or next_agent is None:
+                        # 记录episode
+                        episode_rewards.append(epi_rewards[i])
+                        episode_lengths.append(epi_lengths[i])
+                        epi_rewards[i] = 0.0
+                        epi_lengths[i] = 0
+                        # 重置该子环境
+                        next_obs, _ = self.vec_env.reset_one(i)
+
+                    new_obs_list.append(next_obs)
+
+                obs_list = new_obs_list
+                # 并行分支：本步已完成写入与推进，继续下一步
+                self.global_step += self.num_envs
+                # 跳过单环境下方的存储与推进逻辑
+                continue
+            else:
+                # 单环境
+                current_agent = self.env.agent_selection
+                action_mask = obs["action_mask"]
+                torch_obs = self._numpy_obs_to_torch(obs)
+                torch_action_mask = (
+                    torch.from_numpy(action_mask).unsqueeze(0).to(self.device)
                 )
+                with torch.no_grad():
+                    action, log_prob, _, value = self.model.get_action_and_value(
+                        torch_obs, action_mask=torch_action_mask
+                    )
 
             # 转换为Python标量（确保类型正确）
             action_np = int(action.cpu().item())
             log_prob_np = float(log_prob.cpu().item())
-
-            # 确保value是标量 - 彻底修复
-            if value.numel() > 1:
-                value = value.flatten()[0]  # 取第一个元素
-            elif value.dim() > 0:
-                value = value.squeeze()
-            value_np = float(value.cpu().item())
+            value_np = float(value.squeeze().cpu().item())
 
             # 执行动作
-            self.env.step(action_np)
+            if self.vec_env is None:
+                self.env.step(action_np)
 
             # 获取奖励和终止状态
-            reward = self.env.rewards.get(current_agent, 0.0)
-            done = self.env.terminations.get(current_agent, False)
+            if self.vec_env is None:
+                reward = self.env.rewards.get(current_agent, 0.0)
+                done = self.env.terminations.get(current_agent, False)
 
             # 存储到缓冲区
             self.rollout_buffer.add(
@@ -194,7 +270,7 @@ class MahjongTrainer:
             self.global_step += 1
 
             # 获取下一个观测
-            if self.env.agent_selection is not None:
+            if self.vec_env is None and self.env.agent_selection is not None:
                 obs = self.env.observe(self.env.agent_selection)
 
             # 渲染（如果需要）
@@ -202,7 +278,7 @@ class MahjongTrainer:
                 self.env.render()
 
         # 计算最后一个状态的价值（用于bootstrap）
-        if self.env.agent_selection is not None:
+        if self.vec_env is None and self.env.agent_selection is not None:
             obs = self.env.observe(self.env.agent_selection)
             torch_obs = self._numpy_obs_to_torch(obs)
             with torch.no_grad():
@@ -477,7 +553,7 @@ def main():
         "--config",
         type=str,
         default="default",
-        choices=["default", "fast", "high_performance"],
+        choices=["default", "fast", "high_performance", "multithread"],
         help="配置类型",
     )
     parser.add_argument(
@@ -501,6 +577,10 @@ def main():
         from mahjong_agent.config import get_high_performance_config
 
         config = get_high_performance_config()
+    elif args.config == "multithread":
+        from mahjong_agent.config_multithread import get_multithread_config
+
+        config = get_multithread_config()
 
     # 覆盖配置
     config.device = args.device

@@ -25,7 +25,8 @@ class RolloutBuffer:
         """
         self.config = config
         self.device = device
-        self.buffer_size = config.rollout_steps
+        # 支持并行环境：按 env 数量扩展缓冲容量
+        self.buffer_size = config.rollout_steps * max(1, getattr(config, "num_envs", 1))
         self.pos = 0
         self.full = False
 
