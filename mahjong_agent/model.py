@@ -173,11 +173,14 @@ class TransformerEncoder(nn.Module):
             # (batch, dim) -> (batch, 1, dim)
             x = x.unsqueeze(1)
 
+        # 预归一化以稳定Transformer数值
+        x = self.layer_norm(x)
         x = self.transformer(x)
 
         # 取序列的平均或最后一个
         x = x.mean(dim=1)  # (batch, dim)
 
+        # 后归一化进一步稳定输出
         return self.layer_norm(x)
 
 
@@ -305,10 +308,27 @@ class MahjongActorCritic(nn.Module):
         # 前向传播
         action_logits, value = self.forward(obs, deterministic)
 
+        # 数值稳定性处理：将NaN/Inf替换为有限数，并裁剪范围
+        action_logits = torch.nan_to_num(
+            action_logits, nan=0.0, posinf=1e9, neginf=-1e9
+        )
+        action_logits = action_logits.clamp(min=-50.0, max=50.0)
+
         # 应用动作掩码
         if action_mask is not None:
-            # 将非法动作的logits设置为-inf
-            action_logits = action_logits.masked_fill(action_mask == 0, float("-inf"))
+            # 将非法动作的logits设置为极小值
+            masked_logits = action_logits.masked_fill(action_mask == 0, -1e9)
+
+            # 处理极端情况：如果没有任何合法动作，回退到选择索引0
+            if action_mask.dim() == 2:
+                invalid_rows = action_mask.sum(dim=-1) == 0
+                if invalid_rows.any():
+                    masked_logits[invalid_rows, 0] = 0.0
+            else:
+                if action_mask.sum() == 0:
+                    masked_logits[..., 0] = 0.0
+
+            action_logits = masked_logits
 
         # 创建分类分布
         dist = Categorical(logits=action_logits)
