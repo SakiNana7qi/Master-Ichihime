@@ -14,6 +14,8 @@ numpy>=1.24.0
 # 可视化和日志
 tensorboard>=2.13.0
 tqdm>=4.65.0
+pyqt5>=5.15
+pyqtgraph>=0.13
 
 # 其他工具
 matplotlib>=3.7.0

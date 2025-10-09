@@ -11,6 +11,8 @@ from typing import Optional, Dict
 import numpy as np
 import torch
 from torch.utils.tensorboard import SummaryWriter
+from tqdm import tqdm
+import json
 
 # 添加项目根目录到路径
 project_root = Path(__file__).parent.parent
@@ -79,6 +81,9 @@ class MahjongTrainer:
 
         # TensorBoard
         self.writer = SummaryWriter(log_dir=self.config.log_dir)
+        self.metrics_log_path = os.path.join(
+            self.config.log_dir, "realtime_metrics.jsonl"
+        )
 
         # 加载检查点
         if checkpoint_path is not None:
@@ -243,35 +248,46 @@ class MahjongTrainer:
         print("\n" + "=" * 80)
         print(" " * 30 + "开始训练")
         print("=" * 80)
+        total_updates = self.config.total_timesteps // self.config.rollout_steps
         print(f"总步数: {self.config.total_timesteps:,}")
         print(f"Rollout步数: {self.config.rollout_steps}")
-        print(
-            f"预计迭代次数: {self.config.total_timesteps // self.config.rollout_steps}"
-        )
+        print(f"预计迭代次数: {total_updates}")
         print("=" * 80 + "\n")
 
         start_time = time.time()
 
-        # 主训练循环
-        while self.global_step < self.config.total_timesteps:
-            self.rollout_count += 1
+        # 主训练循环（带进度条）
+        with tqdm(total=total_updates, desc="Training", unit="update") as pbar:
+            while self.global_step < self.config.total_timesteps:
+                self.rollout_count += 1
 
-            # 执行一次训练步骤
-            stats = self.train_step()
+                # 执行一次训练步骤
+                stats = self.train_step()
 
-            # 记录日志
-            if self.rollout_count % self.config.log_interval == 0:
-                self._log_stats(stats, start_time)
+                # 更新进度条状态
+                pbar.set_postfix(
+                    steps=f"{self.global_step:,}",
+                    ret=f"{stats.get('mean_episode_reward', 0):.2f}",
+                    pol=f"{stats.get('policy_loss', 0):.3f}",
+                    val=f"{stats.get('value_loss', 0):.3f}",
+                    ent=f"{stats.get('entropy', 0):.3f}",
+                    kl=f"{stats.get('approx_kl', 0):.3f}",
+                )
+                pbar.update(1)
 
-            # 保存模型
-            if self.rollout_count % self.config.save_interval == 0:
-                self.save_checkpoint(f"checkpoint_{self.rollout_count}.pt")
-                print(f"[OK] Checkpoint saved: checkpoint_{self.rollout_count}.pt")
+                # 记录日志
+                if self.rollout_count % self.config.log_interval == 0:
+                    self._log_stats(stats, start_time)
 
-            # 评估
-            if self.rollout_count % self.config.eval_interval == 0:
-                eval_stats = self.evaluate(num_episodes=5)
-                self._log_eval_stats(eval_stats)
+                # 保存模型
+                if self.rollout_count % self.config.save_interval == 0:
+                    self.save_checkpoint(f"checkpoint_{self.rollout_count}.pt")
+                    print(f"[OK] Checkpoint saved: checkpoint_{self.rollout_count}.pt")
+
+                # 评估
+                if self.rollout_count % self.config.eval_interval == 0:
+                    eval_stats = self.evaluate(num_episodes=5)
+                    self._log_eval_stats(eval_stats)
 
         # 训练结束
         print("\n" + "=" * 80)
@@ -310,6 +326,27 @@ class MahjongTrainer:
             self.writer.add_scalar(f"train/{key}", value, self.global_step)
         self.writer.add_scalar("train/fps", fps, self.global_step)
 
+        # 写入实时JSONL供GUI读取
+        payload = {
+            "type": "train",
+            "time": time.time(),
+            "global_step": int(self.global_step),
+            "rollout": int(self.rollout_count),
+            "fps": float(fps),
+            "clip_range": float(getattr(self.config, "clip_range", 0.0)),
+        }
+        # 将数值型stat写入（忽略不可转float的值）
+        for k, v in stats.items():
+            try:
+                payload[k] = float(v)
+            except Exception:
+                pass
+        try:
+            with open(self.metrics_log_path, "a", encoding="utf-8") as f:
+                f.write(json.dumps(payload, ensure_ascii=False) + "\n")
+        except Exception:
+            pass
+
     def _log_eval_stats(self, stats: Dict[str, float]):
         """记录评估统计信息"""
         if self.config.verbose:
@@ -320,6 +357,24 @@ class MahjongTrainer:
 
         for key, value in stats.items():
             self.writer.add_scalar(f"eval/{key}", value, self.global_step)
+
+        # 写入实时JSONL供GUI读取
+        payload = {
+            "type": "eval",
+            "time": time.time(),
+            "global_step": int(self.global_step),
+            "rollout": int(self.rollout_count),
+        }
+        for k, v in stats.items():
+            try:
+                payload[k] = float(v)
+            except Exception:
+                pass
+        try:
+            with open(self.metrics_log_path, "a", encoding="utf-8") as f:
+                f.write(json.dumps(payload, ensure_ascii=False) + "\n")
+        except Exception:
+            pass
 
     def evaluate(self, num_episodes: int = 10) -> Dict[str, float]:
         """
