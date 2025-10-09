@@ -24,7 +24,9 @@ class RolloutBuffer:
             device: 计算设备
         """
         self.config = config
+        # 训练设备（用于取batch时搬到GPU）；存储一律放在CPU，减少频繁的小拷贝
         self.device = device
+        self.store_device = torch.device("cpu")
         # 支持并行环境：按 env 数量扩展缓冲容量
         self.buffer_size = config.rollout_steps * max(1, getattr(config, "num_envs", 1))
         self.pos = 0
@@ -33,60 +35,60 @@ class RolloutBuffer:
         # 存储观测的各个部分
         self.observations = {
             "hand": torch.zeros(
-                (self.buffer_size, 34), dtype=torch.float32, device=device
+                (self.buffer_size, 34), dtype=torch.float32, device=self.store_device
             ),
             "drawn_tile": torch.zeros(
-                (self.buffer_size, 34), dtype=torch.float32, device=device
+                (self.buffer_size, 34), dtype=torch.float32, device=self.store_device
             ),
             "rivers": torch.zeros(
-                (self.buffer_size, 4, 34), dtype=torch.float32, device=device
+                (self.buffer_size, 4, 34), dtype=torch.float32, device=self.store_device
             ),
             "melds": torch.zeros(
-                (self.buffer_size, 4, 34), dtype=torch.float32, device=device
+                (self.buffer_size, 4, 34), dtype=torch.float32, device=self.store_device
             ),
             "riichi_status": torch.zeros(
-                (self.buffer_size, 4), dtype=torch.float32, device=device
+                (self.buffer_size, 4), dtype=torch.float32, device=self.store_device
             ),
             "scores": torch.zeros(
-                (self.buffer_size, 4), dtype=torch.float32, device=device
+                (self.buffer_size, 4), dtype=torch.float32, device=self.store_device
             ),
             "dora_indicators": torch.zeros(
-                (self.buffer_size, 5, 34), dtype=torch.float32, device=device
+                (self.buffer_size, 5, 34), dtype=torch.float32, device=self.store_device
             ),
             "game_info": torch.zeros(
-                (self.buffer_size, 5), dtype=torch.float32, device=device
+                (self.buffer_size, 5), dtype=torch.float32, device=self.store_device
             ),
             "phase_info": torch.zeros(
-                (self.buffer_size, 3), dtype=torch.float32, device=device
+                (self.buffer_size, 3), dtype=torch.float32, device=self.store_device
             ),
         }
 
         # 动作掩码
         self.action_masks = torch.zeros(
-            (self.buffer_size, config.action_dim), dtype=torch.float32, device=device
+            (self.buffer_size, config.action_dim), dtype=torch.float32, device=self.store_device
         )
 
         # 动作、奖励、值等
-        self.actions = torch.zeros((self.buffer_size,), dtype=torch.long, device=device)
+        self.actions = torch.zeros((self.buffer_size,), dtype=torch.long, device=self.store_device)
         self.log_probs = torch.zeros(
-            (self.buffer_size,), dtype=torch.float32, device=device
+            (self.buffer_size,), dtype=torch.float32, device=self.store_device
         )
         self.rewards = torch.zeros(
-            (self.buffer_size,), dtype=torch.float32, device=device
+            (self.buffer_size,), dtype=torch.float32, device=self.store_device
         )
         self.values = torch.zeros(
-            (self.buffer_size,), dtype=torch.float32, device=device
+            (self.buffer_size,), dtype=torch.float32, device=self.store_device
         )
         self.dones = torch.zeros(
-            (self.buffer_size,), dtype=torch.float32, device=device
+            (self.buffer_size,), dtype=torch.float32, device=self.store_device
         )
 
         # GAE计算结果
         self.advantages = torch.zeros(
-            (self.buffer_size,), dtype=torch.float32, device=device
+            (self.buffer_size,), dtype=torch.float32, device=self.store_device
         )
         self.returns = torch.zeros(
-            (self.buffer_size,), dtype=torch.float32, device=device
+            (self.buffer_size,), dtype=torch.float32, device=self.store_device
         )
 
     def add(
@@ -119,10 +121,10 @@ class RolloutBuffer:
         # 存储观测
         for key, value in obs.items():
             if key != "action_mask":  # action_mask单独存储
-                self.observations[key][self.pos] = torch.from_numpy(value).float()
+                self.observations[key][self.pos] = torch.from_numpy(value).to(self.store_device).float()
 
         # 存储其他数据（确保类型正确）
-        self.action_masks[self.pos] = torch.from_numpy(action_mask).float()
+        self.action_masks[self.pos] = torch.from_numpy(action_mask).to(self.store_device).float()
         self.actions[self.pos] = int(action)
         self.log_probs[self.pos] = float(log_prob)
         self.rewards[self.pos] = float(reward)
@@ -139,6 +141,37 @@ class RolloutBuffer:
         self.dones[self.pos] = float(done)
 
         self.pos += 1
+        if self.pos == self.buffer_size:
+            self.full = True
+
+    def add_batch(
+        self,
+        obs_batch: Dict[str, np.ndarray],
+        actions: np.ndarray,
+        log_probs: np.ndarray,
+        rewards: np.ndarray,
+        values: np.ndarray,
+        dones: np.ndarray,
+        action_masks: np.ndarray,
+    ):
+        """批量添加一整步来自并行环境的数据，形状第一维为 num_envs。"""
+        num_envs = actions.shape[0]
+        if self.pos + num_envs > self.buffer_size:
+            raise RuntimeError("缓冲区已满！请先调用reset()或compute_returns_and_advantages()")
+
+        sl = slice(self.pos, self.pos + num_envs)
+        for key, arr in obs_batch.items():
+            if key == "action_mask":
+                continue
+            self.observations[key][sl] = torch.from_numpy(arr).to(self.store_device).float()
+        self.action_masks[sl] = torch.from_numpy(action_masks).to(self.store_device).float()
+        self.actions[sl] = torch.from_numpy(actions).to(self.store_device).long()
+        self.log_probs[sl] = torch.from_numpy(log_probs).to(self.store_device).float()
+        self.rewards[sl] = torch.from_numpy(rewards).to(self.store_device).float()
+        self.values[sl] = torch.from_numpy(values).to(self.store_device).float()
+        self.dones[sl] = torch.from_numpy(dones).to(self.store_device).float()
+
+        self.pos += num_envs
         if self.pos == self.buffer_size:
             self.full = True
 
@@ -200,7 +233,7 @@ class RolloutBuffer:
             raise RuntimeError("缓冲区未满！请先收集足够的数据")
 
         batch_size = batch_size or self.config.mini_batch_size
-        indices = torch.randperm(self.buffer_size, device=self.device)
+        indices = torch.randperm(self.buffer_size, device=self.store_device)
 
         # 分批返回
         for start_idx in range(0, self.buffer_size, batch_size):
@@ -210,15 +243,15 @@ class RolloutBuffer:
             # 构建批次数据
             batch = {
                 "observations": {
-                    key: self.observations[key][batch_indices]
+                    key: self.observations[key][batch_indices].to(self.device)
                     for key in self.observations
                 },
-                "action_masks": self.action_masks[batch_indices],
-                "actions": self.actions[batch_indices],
-                "old_log_probs": self.log_probs[batch_indices],
-                "advantages": self.advantages[batch_indices],
-                "returns": self.returns[batch_indices],
-                "old_values": self.values[batch_indices],
+                "action_masks": self.action_masks[batch_indices].to(self.device),
+                "actions": self.actions[batch_indices].to(self.device),
+                "old_log_probs": self.log_probs[batch_indices].to(self.device),
+                "advantages": self.advantages[batch_indices].to(self.device),
+                "returns": self.returns[batch_indices].to(self.device),
+                "old_values": self.values[batch_indices].to(self.device),
             }
 
             yield batch

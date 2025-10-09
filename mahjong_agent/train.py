@@ -52,12 +52,38 @@ class MahjongTrainer:
         )
         print(f"使用设备: {self.device}")
 
+        # CUDA 数值精度优化（加速矩阵乘）
+        if self.device.type == "cuda":
+            try:
+                torch.backends.cuda.matmul.allow_tf32 = True
+                torch.backends.cudnn.allow_tf32 = True
+                torch.set_float32_matmul_precision("high")
+                print("已启用 TF32/高精度矩阵乘以提升吞吐")
+            except Exception:
+                pass
+
+        # 设置 PyTorch 线程数和并行策略
+        # 若指定 cpu_core_limit，则将 PyTorch 线程数限制到该值
+        core_limit = getattr(self.config, "cpu_core_limit", None)
+        default_threads = os.cpu_count() or 1
+        num_threads = getattr(self.config, "num_threads", default_threads)
+        if isinstance(core_limit, int) and core_limit > 0:
+            num_threads = min(num_threads, core_limit)
+        torch.set_num_threads(num_threads)
+        torch.set_num_interop_threads(min(4, num_threads // 4))  # 减少线程竞争
+        print(f"PyTorch 线程数: {num_threads} (inter-op: {torch.get_num_interop_threads()})")
+
         # 设置随机种子
         self._set_seed(self.config.seed)
 
         # 创建环境（支持并行）
         self.num_envs = max(1, getattr(self.config, "num_envs", 1))
+        pin_affinity = getattr(self.config, "pin_cpu_affinity", False)
+        
+        print(f"环境配置: num_envs={self.num_envs}, pin_cpu_affinity={pin_affinity}")
+        
         if self.num_envs == 1:
+            print("使用单环境模式")
             self.env = MahjongEnv(
                 render_mode="human" if self.config.render_training else None,
                 seed=self.config.seed,
@@ -65,16 +91,19 @@ class MahjongTrainer:
             self.vec_env = None
         else:
             # 多进程环境（仅用于数据采样阶段）
+            print(f"使用多进程环境模式：{self.num_envs} 个并行环境")
             self.vec_env = SubprocVecEnv(
                 self.num_envs,
                 base_seed=self.config.seed,
-                pin_cpu_affinity=getattr(self.config, "pin_cpu_affinity", True),
+                pin_cpu_affinity=pin_affinity,
+                cpu_core_limit=getattr(self.config, "cpu_core_limit", None),
+                cores_per_proc=getattr(self.config, "cores_per_proc", None),
             )
             self.env = None
+            print(f"多进程环境初始化完成")
 
         # 创建模型
         self.model = MahjongActorCritic(self.config).to(self.device)
-        torch.set_num_threads(getattr(self.config, "num_threads", os.cpu_count() or 1))
         print(f"模型参数量: {sum(p.numel() for p in self.model.parameters()):,}")
 
         # 创建PPO更新器
@@ -143,8 +172,28 @@ class MahjongTrainer:
             # 为所有子环境初始化episode统计
             epi_rewards = [0.0 for _ in range(self.num_envs)]
             epi_lengths = [0 for _ in range(self.num_envs)]
+
+            # 预分配批次缓冲，避免循环内重复分配
+            import numpy as _np
+            first_keys = [k for k in obs_list[0].keys() if k != "action_mask"]
+            np_obs_batch = {
+                k: _np.zeros((self.num_envs,) + _np.asarray(obs_list[0][k]).shape, dtype=_np.asarray(obs_list[0][k]).dtype)
+                for k in first_keys
+            }
+            action_masks_np = _np.zeros((self.num_envs,) + _np.asarray(obs_list[0]["action_mask"]).shape, dtype=_np.asarray(obs_list[0]["action_mask"]).dtype)
+
+            # 预分配GPU批次张量
+            torch_obs_batch = {
+                k: torch.zeros_like(torch.from_numpy(v)).to(self.device)
+                for k, v in np_obs_batch.items()
+            }
+            torch_action_mask = torch.zeros_like(torch.from_numpy(action_masks_np)).to(self.device)
         else:
             obs, info = self.env.reset(seed=self.config.seed + self.global_step)
+
+        import time as _t
+        prof = getattr(self, "_prof", {"env_step": 0.0, "model_infer": 0.0, "ipc": 0.0})
+        loop_start = _t.time()
 
         # 收集rollout_steps步的数据
         for step in range(self.config.rollout_steps):
@@ -162,72 +211,79 @@ class MahjongTrainer:
 
             if self.vec_env is not None:
                 # 并行分支：构造批次推理，并将每个子环境样本写入buffer
-                import numpy as _np
-
-                action_masks = []
-                torch_obs_batch = {}
+                # 填充预分配的批次缓冲
                 for i in range(self.num_envs):
                     o = obs_list[i]
-                    action_masks.append(o["action_mask"])
-                    tobs = self._numpy_obs_to_torch(o)
-                    for k, v in tobs.items():
-                        torch_obs_batch.setdefault(k, []).append(v)
-                for k in torch_obs_batch:
-                    torch_obs_batch[k] = torch.cat(torch_obs_batch[k], dim=0)
-                torch_action_mask = torch.from_numpy(
-                    _np.stack(action_masks, axis=0)
-                ).to(self.device)
+                    for k in np_obs_batch:
+                        _np.copyto(np_obs_batch[k][i], _np.asarray(o[k]))
+                    _np.copyto(action_masks_np[i], _np.asarray(o["action_mask"]))
 
-                with torch.no_grad():
-                    actions_t, log_probs_t, _, values_t = (
-                        self.model.get_action_and_value(
-                            torch_obs_batch, action_mask=torch_action_mask
-                        )
+                # 将CPU批次拷贝到GPU张量（非阻塞）
+                for k in torch_obs_batch:
+                    torch_obs_batch[k].copy_(torch.from_numpy(np_obs_batch[k]), non_blocking=True)
+                torch_action_mask.copy_(torch.from_numpy(action_masks_np), non_blocking=True)
+
+                t0 = _t.time()
+                # 使用 bfloat16 自动混合精度以提升前向速度（4090 友好）
+                with torch.inference_mode():
+                    amp_ctx = (
+                        torch.autocast(device_type="cuda", dtype=torch.bfloat16)
+                        if self.device.type == "cuda"
+                        else torch.autocast(enabled=False)
                     )
-                actions = actions_t.cpu().numpy()  # (N,)
-                log_probs = log_probs_t.cpu().numpy()  # (N,)
-                values = values_t.detach().cpu().numpy()  # (N,)
+                    with amp_ctx:
+                        actions_t, log_probs_t, _, values_t = (
+                            self.model.get_action_and_value(
+                                torch_obs_batch, action_mask=torch_action_mask
+                            )
+                        )
+                t1 = _t.time()
+                # 将少量必要数据搬回CPU并转为可支持的精度
+                actions = actions_t.detach().to(dtype=torch.int64, device="cpu").numpy()  # (N,)
+                log_probs = log_probs_t.detach().to(dtype=torch.float32, device="cpu").numpy()  # (N,)
+                values = values_t.detach().to(dtype=torch.float32, device="cpu").numpy()  # (N,)
 
                 # 步进所有环境
+                t2 = _t.time()
                 results = self.vec_env.step([int(a) for a in actions])
+                t3 = _t.time()
 
-                # 写入buffer并准备下一步观测
-                new_obs_list = []
-                for i, (next_obs, next_agent, reward, done, next_mask) in enumerate(
-                    results
-                ):
-                    # 写入当前样本
-                    vi = float(values[i] if values.ndim > 0 else values)
-                    li = float(log_probs[i] if log_probs.ndim > 0 else log_probs)
-                    ai = int(actions[i] if actions.ndim > 0 else actions)
-                    self.rollout_buffer.add(
-                        obs=obs_list[i],
-                        action=ai,
-                        log_prob=li,
-                        reward=float(reward),
-                        value=vi,
-                        done=bool(done),
-                        action_mask=action_masks[i],
-                    )
-                    # 统计
+                # 聚合本步并行样本后，批量写入缓冲区
+                rewards_np = _np.array([float(r[2]) for r in results], dtype=_np.float32)
+                dones_np = _np.array([bool(r[3]) for r in results], dtype=_np.bool_)
+                obs_batch_np = {k: np_obs_batch[k].copy() for k in np_obs_batch}
+                self.rollout_buffer.add_batch(
+                    obs_batch=obs_batch_np,
+                    actions=actions.astype(_np.int64, copy=False),
+                    log_probs=log_probs.astype(_np.float32, copy=False),
+                    rewards=rewards_np,
+                    values=values.astype(_np.float32, copy=False),
+                    dones=dones_np.astype(_np.float32, copy=False),
+                    action_masks=action_masks_np.astype(_np.float32, copy=False),
+                )
+
+                # 统计与下一步观测
+                new_obs_list = [None] * self.num_envs
+                for i in range(self.num_envs):
+                    next_obs, next_agent, reward, done, next_mask = results[i]
                     epi_rewards[i] += float(reward)
                     epi_lengths[i] += 1
-
-                    # 处理终局重置
                     if next_obs is None or next_agent is None:
-                        # 记录episode
                         episode_rewards.append(epi_rewards[i])
                         episode_lengths.append(epi_lengths[i])
                         epi_rewards[i] = 0.0
                         epi_lengths[i] = 0
-                        # 重置该子环境
                         next_obs, _ = self.vec_env.reset_one(i)
-
-                    new_obs_list.append(next_obs)
+                    new_obs_list[i] = next_obs
 
                 obs_list = new_obs_list
                 # 并行分支：本步已完成写入与推进，继续下一步
                 self.global_step += self.num_envs
+                # 记录时间（仅在开启profile时）
+                if getattr(self.config, "profile_timing", False):
+                    prof["model_infer"] += (t1 - t0)
+                    prof["env_step"] += (t3 - t2)
+                    prof["ipc"] += max(0.0, (t2 - t1))
                 # 跳过单环境下方的存储与推进逻辑
                 continue
             else:
@@ -301,6 +357,19 @@ class MahjongTrainer:
             "mean_episode_length": np.mean(episode_lengths) if episode_lengths else 0.0,
             "num_episodes": len(episode_rewards),
         }
+
+        # 输出剖析信息
+        if getattr(self.config, "profile_timing", False) and self.vec_env is not None:
+            total = max(1e-9, ( _t.time() - loop_start))
+            infer = prof["model_infer"]
+            envs = prof["env_step"]
+            ipc = prof["ipc"]
+            other = max(0.0, total - infer - envs - ipc)
+            print(
+                f"[Profile] infer={infer:.2f}s ({infer/total:.0%}) env_step={envs:.2f}s ({envs/total:.0%}) ipc={ipc:.2f}s ({ipc/total:.0%}) other={other:.2f}s ({other/total:.0%})",
+                flush=True,
+            )
+            self._prof = {"env_step": 0.0, "model_infer": 0.0, "ipc": 0.0}
 
         return stats
 
@@ -468,21 +537,29 @@ class MahjongTrainer:
         """
         self.model.eval()
 
+        # 在并行环境模式下，self.env 为 None，这里创建临时单环境用于评估
+        eval_env = self.env if self.env is not None else MahjongEnv(seed=self.config.seed)
+
         episode_rewards = []
         episode_lengths = []
         wins = 0
 
         for _ in range(num_episodes):
-            obs, info = self.env.reset()
+            obs, info = eval_env.reset()
             episode_reward = 0
             episode_length = 0
             done = False
+            max_steps = 2000  # 安全上限，避免环境异常导致死循环
 
-            while not done:
-                if self.env.agent_selection is None:
+            while not done and episode_length < max_steps:
+                # 终局保护：有些环境在结束时不会立刻将 agent_selection 置为 None
+                if getattr(eval_env, "game_state", None) is not None:
+                    if getattr(eval_env.game_state, "phase", None) == "end":
+                        break
+                if eval_env.agent_selection is None:
                     break
 
-                current_agent = self.env.agent_selection
+                current_agent = eval_env.agent_selection
                 action_mask = obs["action_mask"]
 
                 # 使用确定性策略
@@ -496,22 +573,22 @@ class MahjongTrainer:
                         torch_obs, action_mask=torch_action_mask, deterministic=True
                     )
 
-                self.env.step(action.cpu().item())
+                eval_env.step(action.cpu().item())
 
-                reward = self.env.rewards.get(current_agent, 0.0)
-                done = self.env.terminations.get(current_agent, False)
+                reward = eval_env.rewards.get(current_agent, 0.0)
+                done = eval_env.terminations.get(current_agent, False)
 
                 episode_reward += reward
                 episode_length += 1
 
-                if self.env.agent_selection is not None:
-                    obs = self.env.observe(self.env.agent_selection)
+                if eval_env.agent_selection is not None:
+                    obs = eval_env.observe(eval_env.agent_selection)
 
             episode_rewards.append(episode_reward)
             episode_lengths.append(episode_length)
 
             # 检查是否获胜（player_0的奖励最高）
-            if self.env.rewards.get("player_0", 0) > 0:
+            if eval_env.rewards.get("player_0", 0) > 0:
                 wins += 1
 
         return {
@@ -565,6 +642,9 @@ def main():
     )
     parser.add_argument("--device", type=str, default="cuda", help="设备 (cuda/cpu)")
     parser.add_argument("--seed", type=int, default=42, help="随机种子")
+    parser.add_argument("--cpu-core-limit", type=int, default=0, help="限制可用CPU核心数（0表示不限制）")
+    parser.add_argument("--num-envs", type=int, default=0, help="并行环境数（0表示使用配置默认值）")
+    parser.add_argument("--profile", action="store_true", help="输出训练阶段耗时剖析")
 
     args = parser.parse_args()
 
@@ -585,10 +665,21 @@ def main():
         from mahjong_agent.config_multithread import get_multithread_config
 
         config = get_multithread_config()
+        # 如命令行提供限制与环境数，则在下方统一覆盖
+        config.pin_cpu_affinity = True
 
     # 覆盖配置
     config.device = args.device
     config.seed = args.seed
+    # 覆盖 CPU 限制与并行环境数
+    if args.cpu_core_limit and args.cpu_core_limit > 0:
+        config.cpu_core_limit = args.cpu_core_limit
+        # 将 PyTorch 线程数也限制到该值
+        config.num_threads = min(getattr(config, "num_threads", os.cpu_count() or 1), args.cpu_core_limit)
+    if args.num_envs and args.num_envs > 0:
+        config.num_envs = args.num_envs
+    if args.profile:
+        config.profile_timing = True
 
     # 创建训练器并开始训练
     trainer = MahjongTrainer(config=config, checkpoint_path=args.checkpoint)

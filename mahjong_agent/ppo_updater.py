@@ -109,10 +109,24 @@ class PPOUpdater:
                     advantages.std() + 1e-8
                 )
 
-                # 前向传播：获取当前策略的动作概率和价值
-                _, new_log_probs, entropy, new_values = self.model.get_action_and_value(
-                    obs, action_mask=action_masks, action=actions
-                )
+                # 前向传播：启用 AMP 以提升吞吐（bfloat16/TF32）
+                if obs["hand"].is_cuda:
+                    amp_ctx = torch.autocast(device_type="cuda", dtype=torch.bfloat16)
+                else:
+                    class _Null:
+                        def __enter__(self):
+                            return None
+                        def __exit__(self, *args):
+                            return False
+                    amp_ctx = _Null()
+                with amp_ctx:
+                    _, new_log_probs, entropy, new_values = self.model.get_action_and_value(
+                        obs, action_mask=action_masks, action=actions
+                    )
+                    # 训练时 loss 以 float32 计算更稳定
+                    new_log_probs = new_log_probs.float()
+                    entropy = entropy.float()
+                    new_values = new_values.float()
 
                 # ==================== 策略损失 ====================
                 # 计算重要性采样比率

@@ -4,7 +4,7 @@ PPO训练超参数配置
 """
 
 from dataclasses import dataclass
-from typing import Literal
+from typing import Literal, Optional
 
 
 @dataclass
@@ -15,7 +15,9 @@ class PPOConfig:
     # 环境相关参数
     # ========================
     num_agents: int = 4  # 智能体数量
-    observation_dim: int = 34 + 34 + 4 * 34 + 4 * 34 + 4 + 4 + 5 * 34 + 5 + 3  # 观测维度
+    observation_dim: int = (
+        34 + 34 + 4 * 34 + 4 * 34 + 4 + 4 + 5 * 34 + 5 + 3
+    )  # 观测维度
     action_dim: int = 112  # 动作空间大小
 
     # ========================
@@ -80,6 +82,9 @@ class PPOConfig:
     seed: int = 42  # 随机种子
     device: str = "cuda"  # 设备 ("cuda" 或 "cpu")
     num_threads: int = 4  # PyTorch线程数
+    pin_cpu_affinity: bool = False  # 是否为子进程设置CPU亲和度
+    cpu_core_limit: int | None = None  # 限制可用CPU核心数（None表示不限制）
+    cores_per_proc: Optional[int] = None  # 每个子进程绑定的核心数（None则自动计算）
 
     # 路径
     save_dir: str = "./checkpoints"  # 模型保存路径
@@ -88,11 +93,14 @@ class PPOConfig:
     # 调试
     verbose: bool = True  # 是否打印详细信息
     render_training: bool = False  # 训练时是否渲染（会很慢）
+    profile_timing: bool = False  # 是否输出阶段耗时剖析
 
     def __post_init__(self):
         """配置验证"""
         assert self.gamma > 0 and self.gamma <= 1, "gamma必须在(0, 1]之间"
-        assert self.gae_lambda >= 0 and self.gae_lambda <= 1, "gae_lambda必须在[0, 1]之间"
+        assert (
+            self.gae_lambda >= 0 and self.gae_lambda <= 1
+        ), "gae_lambda必须在[0, 1]之间"
         assert self.clip_range > 0, "clip_range必须大于0"
         assert self.learning_rate > 0, "learning_rate必须大于0"
         assert self.rollout_steps > 0, "rollout_steps必须大于0"
@@ -103,6 +111,7 @@ class PPOConfig:
 
 
 # 预设配置
+
 
 def get_default_config() -> PPOConfig:
     """获取默认配置（适合初期训练）"""
