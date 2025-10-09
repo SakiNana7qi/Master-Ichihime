@@ -65,7 +65,11 @@ class MahjongTrainer:
             self.vec_env = None
         else:
             # 多进程环境（仅用于数据采样阶段）
-            self.vec_env = SubprocVecEnv(self.num_envs, base_seed=self.config.seed)
+            self.vec_env = SubprocVecEnv(
+                self.num_envs,
+                base_seed=self.config.seed,
+                pin_cpu_affinity=getattr(self.config, "pin_cpu_affinity", True),
+            )
             self.env = None
 
         # 创建模型

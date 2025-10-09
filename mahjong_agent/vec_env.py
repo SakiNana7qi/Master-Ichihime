@@ -7,6 +7,7 @@
 
 import os
 import multiprocessing as mp
+import platform
 from typing import List, Tuple, Optional
 
 
@@ -54,11 +55,14 @@ def _env_worker(remote, parent_remote, seed: Optional[int]):
 
 
 class SubprocVecEnv:
-    def __init__(self, num_envs: int, base_seed: int = 42):
+    def __init__(
+        self, num_envs: int, base_seed: int = 42, pin_cpu_affinity: bool = False
+    ):
         self.num_envs = num_envs
         self.closed = False
         self.remotes, self.work_remotes = zip(*[mp.Pipe() for _ in range(num_envs)])
         self.processes: List[mp.Process] = []
+        self.pin_cpu_affinity = pin_cpu_affinity
 
         for idx, (work_remote, remote) in enumerate(
             zip(self.work_remotes, self.remotes)
@@ -70,6 +74,33 @@ class SubprocVecEnv:
             p.start()
             work_remote.close()
             self.processes.append(p)
+
+        # 可选：为子进程设置CPU亲和度（Windows/Linux），尽量分散到不同核
+        if self.pin_cpu_affinity:
+            self._pin_affinity()
+
+    def _pin_affinity(self):
+        try:
+            import psutil  # type: ignore
+        except Exception:
+            return
+
+        try:
+            cpu_count = psutil.cpu_count(logical=True) or self.num_envs
+            if not cpu_count:
+                return
+            cores_per_proc = max(1, cpu_count // self.num_envs)
+            for i, p in enumerate(self.processes):
+                try:
+                    proc = psutil.Process(p.pid)
+                    start = (i * cores_per_proc) % cpu_count
+                    end = min(start + cores_per_proc, cpu_count)
+                    mask = list(range(start, end)) or [i % cpu_count]
+                    proc.cpu_affinity(mask)
+                except Exception:
+                    pass
+        except Exception:
+            pass
 
     def reset(self, seeds: Optional[List[int]] = None):
         obs_list = []

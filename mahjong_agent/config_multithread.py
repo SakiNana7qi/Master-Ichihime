@@ -16,6 +16,7 @@ def get_multithread_config() -> PPOConfig:
         # 并行
         num_envs=8,  # 并行环境数（4~16按机器调）
         num_threads=32,  # PyTorch CPU线程（24~48按机器调）
+        # 可在外部设置：config.pin_cpu_affinity=True 启用Windows/Linux下子进程CPU亲和度分散
         # 采样与优化
         rollout_steps=4096,  # 更大的rollout提升吞吐与稳定
         mini_batch_size=1024,  # 提高batch尺寸以提升GPU利用率
