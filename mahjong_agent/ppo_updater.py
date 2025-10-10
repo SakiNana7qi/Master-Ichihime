@@ -57,19 +57,29 @@ class PPOUpdater:
         """创建学习率调度器"""
         if self.config.lr_schedule == "constant":
             return None
-        elif self.config.lr_schedule == "linear":
-            total_updates = (
-                self.config.total_timesteps // self.config.rollout_steps
-            ) * self.config.num_epochs
+        
+        # 计算整个训练期间的优化步数（以小批次为步）
+        # buffer_size = rollout_steps * num_envs（并行环境会放大每次update消耗的样本数）
+        effective_num_envs = max(1, getattr(self.config, "num_envs", 1))
+        buffer_size_per_update = self.config.rollout_steps * effective_num_envs
+        # 每个epoch内的batch数
+        num_batches_per_epoch = max(1, buffer_size_per_update // self.config.mini_batch_size)
+        # 总的优化步数（按batch计）
+        total_opt_steps = max(
+            1,
+            (self.config.total_timesteps // buffer_size_per_update)
+            * self.config.num_epochs
+            * num_batches_per_epoch,
+        )
+
+        if self.config.lr_schedule == "linear":
+            # 线性从1降到0，并钳制为非负，避免学习率变成负数
             return optim.lr_scheduler.LambdaLR(
-                self.optimizer, lambda step: 1 - step / total_updates
+                self.optimizer, lr_lambda=lambda step: max(0.0, 1.0 - step / total_opt_steps)
             )
         elif self.config.lr_schedule == "cosine":
-            total_updates = (
-                self.config.total_timesteps // self.config.rollout_steps
-            ) * self.config.num_epochs
             return optim.lr_scheduler.CosineAnnealingLR(
-                self.optimizer, T_max=total_updates
+                self.optimizer, T_max=total_opt_steps
             )
         else:
             raise ValueError(f"未知的学习率调度: {self.config.lr_schedule}")

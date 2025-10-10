@@ -121,11 +121,17 @@ class MahjongTrainer:
         os.makedirs(self.config.save_dir, exist_ok=True)
         os.makedirs(self.config.log_dir, exist_ok=True)
 
-        # TensorBoard
-        self.writer = SummaryWriter(log_dir=self.config.log_dir)
-        self.metrics_log_path = os.path.join(
-            self.config.log_dir, "realtime_metrics.jsonl"
+        # TensorBoard：每次训练写入独立子目录，避免不同实验混合
+        run_stamp = time.strftime("%Y%m%d_%H%M%S")
+        self.run_dir = os.path.join(
+            self.config.log_dir,
+            f"run_{run_stamp}_seed{self.config.seed}_envs{self.num_envs}",
         )
+        os.makedirs(self.run_dir, exist_ok=True)
+        print(f"日志目录: {self.run_dir}")
+
+        self.writer = SummaryWriter(log_dir=self.run_dir)
+        self.metrics_log_path = os.path.join(self.run_dir, "realtime_metrics.jsonl")
 
         # 加载检查点
         if checkpoint_path is not None:
@@ -397,9 +403,11 @@ class MahjongTrainer:
         print("\n" + "=" * 80)
         print(" " * 30 + "开始训练")
         print("=" * 80)
-        total_updates = self.config.total_timesteps // self.config.rollout_steps
+        # 预计迭代次数需要考虑并行环境数：每次rollout实际收集 rollout_steps * num_envs 的样本
+        effective_envs = max(1, getattr(self.config, "num_envs", 1))
+        total_updates = max(1, self.config.total_timesteps // (self.config.rollout_steps * effective_envs))
         print(f"总步数: {self.config.total_timesteps:,}")
-        print(f"Rollout步数: {self.config.rollout_steps}")
+        print(f"Rollout步数: {self.config.rollout_steps} (并行环境: {effective_envs})")
         print(f"预计迭代次数: {total_updates}")
         print("=" * 80 + "\n")
 

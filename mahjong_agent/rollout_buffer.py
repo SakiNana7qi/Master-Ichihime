@@ -181,37 +181,45 @@ class RolloutBuffer:
         """
         使用GAE算法计算优势和回报
 
+        注意：缓冲区按 [env0..envN-1, env0..envN-1, ...] 追加，
+        因此在并行环境下需要按步长 num_envs 回溯，避免跨环境串联。
+
         Args:
-            last_value: 最后一个状态的价值估计（用于bootstrap）
-            last_done: 最后一个状态是否终止
+            last_value: 为兼容旧接口保留（并行下我们不在rollout尾部bootstrap）
+            last_done: 为兼容旧接口保留
         """
-        # GAE计算
+        num_envs = max(1, getattr(self.config, "num_envs", 1))
+        T = self.buffer_size // num_envs  # 每个环境的时间长度
+
         advantages = torch.zeros_like(self.rewards)
-        last_gae_lam = 0
 
-        for t in reversed(range(self.buffer_size)):
-            if t == self.buffer_size - 1:
-                next_non_terminal = 1.0 - float(last_done)
-                next_value = last_value
-            else:
-                next_non_terminal = 1.0 - self.dones[t + 1]
-                next_value = self.values[t + 1]
+        # 逐环境回溯计算GAE
+        for env_id in range(num_envs):
+            last_gae_lam = 0.0
+            for t in reversed(range(T)):
+                idx = env_id + t * num_envs
+                if t == T - 1:
+                    # rollout 末尾不做 bootstrap，作为终止处理
+                    next_non_terminal = 0.0
+                    next_value = 0.0
+                else:
+                    next_idx = env_id + (t + 1) * num_envs
+                    next_non_terminal = 1.0 - float(self.dones[next_idx].item())
+                    next_value = float(self.values[next_idx].item())
 
-            # TD误差: δ_t = r_t + γ * V(s_{t+1}) - V(s_t)
-            delta = (
-                self.rewards[t]
-                + self.config.gamma * next_value * next_non_terminal
-                - self.values[t]
-            )
-
-            # GAE: A_t = δ_t + γ * λ * A_{t+1}
-            advantages[t] = last_gae_lam = (
-                delta
-                + self.config.gamma
-                * self.config.gae_lambda
-                * next_non_terminal
-                * last_gae_lam
-            )
+                delta = (
+                    float(self.rewards[idx].item())
+                    + self.config.gamma * next_value * next_non_terminal
+                    - float(self.values[idx].item())
+                )
+                last_gae_lam = (
+                    delta
+                    + self.config.gamma
+                    * self.config.gae_lambda
+                    * next_non_terminal
+                    * last_gae_lam
+                )
+                advantages[idx] = last_gae_lam
 
         # 回报 = 优势 + 价值
         self.advantages = advantages
