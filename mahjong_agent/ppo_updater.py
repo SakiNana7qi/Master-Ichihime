@@ -130,6 +130,7 @@ class PPOUpdater:
                             return False
                     amp_ctx = _Null()
                 with amp_ctx:
+                    # 前向与损失一起做大批量，infer吞吐更好
                     _, new_log_probs, entropy, new_values = self.model.get_action_and_value(
                         obs, action_mask=action_masks, action=actions
                     )

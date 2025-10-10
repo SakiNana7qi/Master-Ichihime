@@ -65,6 +65,12 @@ class PlayerState:
     def discard_tile(self, tile: str, is_tsumogiri: bool = False):
         """打出一张牌到牌河"""
         if self.remove_tile(tile):
+            # 若不是摸切，则表示从手牌打出；根据麻将规则，本巡摸到的牌应并入手牌
+            # 以保持每巡结束后“手牌始终为13张”。
+            if not is_tsumogiri and self.drawn_tile:
+                self.hand.append(self.drawn_tile)
+                self.hand.sort()
+                self.drawn_tile = ""
             self.river.append(tile)
             self.river_tsumogiri.append(is_tsumogiri)
             self.last_discard = tile

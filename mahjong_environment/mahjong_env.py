@@ -180,9 +180,26 @@ class MahjongEnv:
         # 更新下一个需要行动的玩家
         self._update_agent_selection()
 
+        # 若长时间停在打牌阶段且未真正摸牌（例如 tiles_remaining 未减少），
+        # 当当前玩家没有 drawn_tile 时尝试自动摸牌推进（防御性修正）
+        if self.game_state.phase == "discard":
+            cur = self.game_state.current_player
+            cur_player = self.game_state.players[cur]
+            if not cur_player.drawn_tile and self.game_state.tiles_remaining > 0:
+                self.game_state.phase = "draw"
+                tile = self.game_state.draw_tile(cur)
+                if tile is None:
+                    self._handle_draw()
+                else:
+                    self.game_state.phase = "discard"
+                    self.agent_selection = f"player_{cur}"
+
         # 检查游戏是否结束
         if self.game_state.phase == "end":
             self._handle_round_end()
+        # 缓存当前智能体的最新观测，确保一致性
+        if self.agent_selection is not None:
+            self._last_observations[self.agent_selection] = self.observe(self.agent_selection)
 
     def observe(self, agent: str) -> Dict:
         """
@@ -200,6 +217,14 @@ class MahjongEnv:
 
         player_id = int(agent.split("_")[1])
         player = self.game_state.players[player_id]
+
+        # 若处于摸牌阶段且轮到该玩家，先执行摸牌以避免出现无动作可选
+        if self.game_state.phase == "draw" and self.game_state.current_player == player_id:
+            tile = self.game_state.draw_tile(player_id)
+            if tile is None:
+                self._handle_draw()
+            else:
+                self.game_state.phase = "discard"
 
         # 构建观测
         obs = {}
@@ -283,11 +308,15 @@ class MahjongEnv:
         _, action_mask = self.legal_actions_helper.get_legal_actions(
             player_id, self.game_state
         )
-        # 防御：在非响应阶段，确保 PASS 不可选，避免外层选择到无效 PASS 而卡住
+        from .utils.action_encoder import ActionEncoder as _AE
+        # 防御：在非响应阶段，确保 PASS 不可选
         if self.game_state.phase != "response":
-            from .utils.action_encoder import ActionEncoder as _AE
             if 0 <= _AE.PASS < len(action_mask):
                 action_mask[_AE.PASS] = False
+        # 防御：在响应阶段但该玩家不在待响应列表时，允许 PASS 以推进
+        else:
+            if player_id not in self.game_state.pending_responses and 0 <= _AE.PASS < len(action_mask):
+                action_mask[_AE.PASS] = True
         obs["action_mask"] = np.array(action_mask, dtype=np.int8)
 
         return obs
@@ -402,6 +431,16 @@ class MahjongEnv:
 
         player = self.game_state.players[player_id]
 
+        # 规范流程保障：若当前玩家尚未摸牌，则先摸一张（若牌山空则流局）
+        if not player.drawn_tile:
+            tile_drawn = self.game_state.draw_tile(player_id)
+            if tile_drawn is None:
+                # 牌山空，直接流局
+                self._handle_draw()
+                return
+            # 进入打牌阶段
+            self.game_state.phase = "discard"
+
         # 兼容赤五：若请求打出5m/5p/5s，但实际手牌为赤5(0m/0p/0s)，则替换为赤五以确保能移除
         tile = tile_req
         if (
@@ -421,10 +460,29 @@ class MahjongEnv:
         # 判断是否为摸切
         is_tsumogiri = tile == player.drawn_tile
 
-        # 打出牌
-        self.game_state.discard_tile(player_id, tile, is_tsumogiri)
+        # 打出牌（若目标牌不存在，则兜底打出一张真实存在的牌以避免死锁）
+        success = self.game_state.discard_tile(player_id, tile, is_tsumogiri)
+        if not success:
+            # 优先打出摸到的牌；否则打出手牌第一张
+            fallback_tile = player.drawn_tile if player.drawn_tile else (player.hand[0] if player.hand else "")
+            if fallback_tile:
+                is_tsumogiri_fb = fallback_tile == player.drawn_tile
+                self.game_state.discard_tile(player_id, fallback_tile, is_tsumogiri_fb)
 
         # 进入响应阶段，询问其他玩家是否要鸣牌/和牌
+        self.game_state.phase = "response"
+        self.game_state.pending_responses = [i for i in range(4) if i != player_id]
+
+    def _force_discard(self, player_id: int):
+        """吃/碰/杠后的强制打牌：不摸牌，直接从现有手中打一张，推进到响应阶段。"""
+        player = self.game_state.players[player_id]
+        # 选择要打出的牌：优先打出刚摸到的牌（若存在），否则打出手牌第一张
+        tile = player.drawn_tile if player.drawn_tile else (player.hand[0] if player.hand else "")
+        if not tile:
+            return
+        is_tsumogiri = tile == player.drawn_tile
+        self.game_state.discard_tile(player_id, tile, is_tsumogiri)
+        # 进入响应阶段
         self.game_state.phase = "response"
         self.game_state.pending_responses = [i for i in range(4) if i != player_id]
 
@@ -454,7 +512,7 @@ class MahjongEnv:
         # 添加副露
         player.add_meld(meld)
 
-        # 吃牌后，轮到该玩家
+        # 吃牌后，轮到该玩家（不摸牌），立刻打出一张
         self.game_state.current_player = player_id
         self.game_state.phase = "discard"
         self.game_state.last_discard_can_be_claimed = False
@@ -463,6 +521,9 @@ class MahjongEnv:
         for p in self.game_state.players:
             if p.player_id != player_id:
                 p.break_ippatsu()
+
+        # 规则：吃后必须立即打出一张牌（不摸牌）。为防止停滞，这里直接执行一次强制打牌推进。
+        self._force_discard(player_id)
 
     def _handle_pon(self, player_id: int):
         """处理碰牌动作"""
@@ -488,7 +549,7 @@ class MahjongEnv:
         # 添加副露
         player.add_meld(meld)
 
-        # 碰牌后，轮到该玩家
+        # 碰牌后，轮到该玩家（不摸牌），立刻打出一张
         self.game_state.current_player = player_id
         self.game_state.phase = "discard"
         self.game_state.last_discard_can_be_claimed = False
@@ -496,6 +557,9 @@ class MahjongEnv:
         # 打断所有玩家的一发
         for p in self.game_state.players:
             p.break_ippatsu()
+
+        # 规则：碰后必须立即打出一张牌（不摸牌）
+        self._force_discard(player_id)
 
     def _handle_minkan(self, player_id: int):
         """处理明杠动作"""
@@ -536,6 +600,9 @@ class MahjongEnv:
         for p in self.game_state.players:
             p.break_ippatsu()
 
+        # 规则：明杠后岭上摸牌后仍需打出一张牌
+        self._force_discard(player_id)
+
     def _handle_ankan(self, player_id: int):
         """处理暗杠动作"""
         player = self.game_state.players[player_id]
@@ -544,7 +611,8 @@ class MahjongEnv:
         ankan_tiles = self.meld_helper.can_ankan(player.get_all_tiles())
 
         if not ankan_tiles:
-            # 暗杠失败则不改变响应队列（暗杠发生在打牌者回合）
+            # 暗杠不可行则退化为打牌，避免停滞
+            self._force_discard(player_id)
             return
 
         # 简化：杠第一种可以杠的牌
@@ -583,7 +651,8 @@ class MahjongEnv:
         )
 
         if result is None:
-            # 加杠失败不应卡住流程（发生在打牌者回合）
+            # 加杠不可行则退化为打牌
+            self._force_discard(player_id)
             return
 
         kakan_meld, original_pon, tile_to_remove = result
@@ -607,6 +676,9 @@ class MahjongEnv:
         # 加杠可以被抢杠，需要询问其他玩家
         # 简化处理：暂不实现抢杠
 
+        # 规则：加杠后岭上摸牌后仍需打出一张牌
+        self._force_discard(player_id)
+
     def _handle_tsumo(self, player_id: int):
         """处理自摸和动作"""
         player = self.game_state.players[player_id]
@@ -626,7 +698,8 @@ class MahjongEnv:
         result = self.scorer.calculate_score(hand_info, scorer_state)
 
         if result.error:
-            # 自摸失败（理论上不应发生）；为稳健起见视为继续打牌，不进入响应阶段
+            # 自摸不成立则退化为打牌
+            self._force_discard(player_id)
             return
 
         # 创建结算结果
@@ -747,17 +820,6 @@ class MahjongEnv:
             self.agent_selection = f"player_{self.game_state.current_player}"
             # 安全校正：在打牌阶段不应保留可被鸣牌标志
             self.game_state.last_discard_can_be_claimed = False
-            # 若出现长时间停留在 discard 且 tiles_remaining 未变化的情况，强制推进摸牌（防御）
-            # 仅当当前玩家没有 drawn_tile（说明尚未摸牌）时尝试
-            cur_player = self.game_state.players[self.game_state.current_player]
-            if not cur_player.drawn_tile and self.game_state.tiles_remaining > 0:
-                self.game_state.phase = "draw"
-                tile = self.game_state.draw_tile(self.game_state.current_player)
-                if tile is None:
-                    self._handle_draw()
-                else:
-                    self.game_state.phase = "discard"
-                    self.agent_selection = f"player_{self.game_state.current_player}"
 
     def _handle_draw(self):
         """处理流局"""

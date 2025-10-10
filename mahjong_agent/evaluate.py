@@ -131,6 +131,11 @@ class MahjongEvaluator:
                         break
                 if self.env.agent_selection is None:
                     break
+                # 确保每步开始时获取当前智能体的最新观测
+                try:
+                    obs = self.env.observe(self.env.agent_selection)
+                except Exception:
+                    pass
                 if max_steps > 0 and episode_length >= max_steps:
                     if verbose:
                         print(f"[警告] 单局步数超过上限 {max_steps}，提前结束该局。")
@@ -149,10 +154,21 @@ class MahjongEvaluator:
                 current_agent = self.env.agent_selection
                 action_mask = obs["action_mask"]
                 if np.asarray(action_mask).sum() <= 0:
-                    if verbose and not warned_zero_mask:
-                        print("[警告] action_mask 全为0，提前结束该局以避免卡死。")
-                        warned_zero_mask = True
-                    break
+                    # 尝试一次自救：若在draw阶段或无drawn_tile，则触发一次观察促使摸牌
+                    try:
+                        if getattr(self.env, "game_state", None) is not None:
+                            gs = self.env.game_state
+                            if gs.phase == "draw" and self.env.agent_selection == current_agent:
+                                # 再获取一次观测（环境 observe 内已实现 draw→discard 推进）
+                                obs = self.env.observe(current_agent)
+                                action_mask = obs.get("action_mask", action_mask)
+                    except Exception:
+                        pass
+                    if np.asarray(action_mask).sum() <= 0:
+                        if verbose and not warned_zero_mask:
+                            print("[警告] action_mask 全为0，提前结束该局以避免卡死。")
+                            warned_zero_mask = True
+                        break
 
                 # 获取动作（确定性路径：直接前向 + 掩码 + argmax，避免分布/对数概率计算开销）
                 torch_obs = self._numpy_obs_to_torch(obs)
@@ -263,6 +279,11 @@ class MahjongEvaluator:
                     break
             if self.env.agent_selection is None:
                 break
+            # 确保每步开始时获取当前智能体的最新观测
+            try:
+                obs = self.env.observe(self.env.agent_selection)
+            except Exception:
+                pass
             if max_steps > 0 and step >= max_steps:
                 print(f"[警告] 交互演示步数超过上限 {max_steps}，提前结束。")
                 break
@@ -312,6 +333,29 @@ class MahjongEvaluator:
                 sel_prob = None
             if sel_prob is not None:
                 print(f"  动作概率: {sel_prob:.3f}")
+
+            # 输出所有玩家手牌与副露（仅交互演示用于人工校对）
+            try:
+                from mahjong_environment.utils.tile_utils import format_hand as _format_hand
+                gs = self.env.game_state
+                for i, agent in enumerate(self.env.possible_agents):
+                    player = gs.players[i]
+                    hand_tiles = player.get_all_tiles()
+                    tile_cnt = len(hand_tiles)
+                    has_drawn = bool(player.drawn_tile)
+                    print(f"  {agent} 手牌({tile_cnt}张, 摸牌={'是' if has_drawn else '否'}): {_format_hand(hand_tiles)}", end=' ')
+                    try:
+                        if player.open_melds:
+                            meld_strs = []
+                            for m in player.open_melds:
+                                meld_strs.append(f"{m.meld_type}:{_format_hand(m.tiles)}")
+                            print(f"  {agent} 副露: {' | '.join(meld_strs)}")
+                        else:
+                            print(f"  {agent} 副露: 无")
+                    except Exception:
+                        pass
+            except Exception:
+                pass
 
             # 执行动作
             self.env.step(action.cpu().item())

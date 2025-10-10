@@ -61,11 +61,11 @@ class PPOConfig:
     # 训练流程参数
     # ========================
     # Rollout参数
-    rollout_steps: int = 2048  # 每次收集的步数
+    rollout_steps: int = 8192  # 每次收集的步数（增大以提升GPU批处理）
     num_envs: int = 1  # 并行环境数（暂时设为1，后续可扩展）
 
     # 训练总步数
-    total_timesteps: int = 10_000_000  # 总训练步数
+    total_timesteps: int = 100_000_000  # 总训练步数（扩大10倍）
     log_interval: int = 10  # 日志记录间隔（多少次rollout）
     save_interval: int = 50  # 模型保存间隔（多少次rollout）
     eval_interval: int = 20  # 评估间隔（多少次rollout）
@@ -105,9 +105,11 @@ class PPOConfig:
         assert self.learning_rate > 0, "learning_rate必须大于0"
         assert self.rollout_steps > 0, "rollout_steps必须大于0"
         assert self.mini_batch_size > 0, "mini_batch_size必须大于0"
+        # 在并行环境下，应确保 (rollout_steps * num_envs) 能被 mini_batch_size 整除
+        effective_envs = max(1, getattr(self, "num_envs", 1))
         assert (
-            self.rollout_steps % self.mini_batch_size == 0
-        ), "rollout_steps应该能被mini_batch_size整除"
+            (self.rollout_steps * effective_envs) % self.mini_batch_size == 0
+        ), "(rollout_steps * num_envs) 应能被 mini_batch_size 整除"
 
 
 # 预设配置
@@ -134,9 +136,9 @@ def get_fast_config() -> PPOConfig:
 def get_high_performance_config() -> PPOConfig:
     """获取高性能配置（用于长时间训练）"""
     return PPOConfig(
-        rollout_steps=4096,
-        mini_batch_size=512,
-        total_timesteps=50_000_000,
+        rollout_steps=16384,
+        mini_batch_size=4096,
+        total_timesteps=500_000_000,
         hidden_dim=1024,
         num_hidden_layers=4,
         use_transformer=True,
