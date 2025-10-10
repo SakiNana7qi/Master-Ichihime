@@ -67,7 +67,7 @@ def test_random_actions():
     env = MahjongEnv(render_mode="human", seed=42)
     obs, info = env.reset(seed=42)
 
-    max_steps = 50  # 限制步数避免无限循环
+    max_steps = 5000  # 限制步数避免无限循环
     step_count = 0
 
     print("开始执行随机动作...")

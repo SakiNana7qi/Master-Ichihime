@@ -38,20 +38,40 @@ class MahjongEvaluator:
         self.device = torch.device(device if torch.cuda.is_available() else "cpu")
         print(f"使用设备: {self.device}")
 
-        # 加载模型
-        checkpoint = torch.load(model_path, map_location=self.device)
+        # 加载模型（兼容 PyTorch 2.6 的 weights_only 安全默认）
+        # 1) 首选显式允许 PPOConfig 的反序列化，并使用 weights_only=False 读取完整检查点
+        # 2) 回退到 weights_only=True 仅加载 state_dict
+        try:
+            # 允许 PPOConfig 作为安全全局类型
+            try:
+                torch.serialization.add_safe_globals([PPOConfig])
+            except Exception:
+                pass
 
-        if config is None:
-            # 从检查点加载配置
-            config = checkpoint.get("config", PPOConfig())
+            checkpoint = torch.load(
+                model_path, map_location=self.device, weights_only=False
+            )
+            state_dict = checkpoint.get("model_state_dict", checkpoint)
+            if config is None:
+                config = checkpoint.get("config", PPOConfig())
+            loaded_step = checkpoint.get("global_step", "N/A")
+        except Exception:
+            # 仅加载权重
+            state_dict = torch.load(
+                model_path, map_location=self.device, weights_only=True
+            )
+            checkpoint = {"model_state_dict": state_dict}
+            if config is None:
+                config = PPOConfig()
+            loaded_step = "N/A"
 
         self.config = config
         self.model = MahjongActorCritic(config).to(self.device)
-        self.model.load_state_dict(checkpoint["model_state_dict"])
+        self.model.load_state_dict(state_dict)
         self.model.eval()
 
         print(f"已加载模型: {model_path}")
-        print(f"训练步数: {checkpoint.get('global_step', 'N/A')}")
+        print(f"训练步数: {loaded_step}")
 
         # 创建环境
         self.env = MahjongEnv(render_mode=None)
@@ -71,6 +91,7 @@ class MahjongEvaluator:
         num_episodes: int = 100,
         deterministic: bool = True,
         verbose: bool = True,
+        max_steps: int = 2000,  # 0 表示不限制步数，仅依赖环境的终局信号
     ) -> Dict[str, float]:
         """
         评估模型性能
@@ -100,25 +121,51 @@ class MahjongEvaluator:
             episode_length = 0
             episode_reward_acc = {f"player_{i}": 0.0 for i in range(4)}
 
+            warned_zero_mask = False
+            last_tiles_remaining = None
+
             while True:
+                # 终局/异常状态保护
+                if getattr(self.env, "game_state", None) is not None:
+                    if getattr(self.env.game_state, "phase", None) == "end":
+                        break
                 if self.env.agent_selection is None:
+                    break
+                if max_steps > 0 and episode_length >= max_steps:
+                    if verbose:
+                        print(f"[警告] 单局步数超过上限 {max_steps}，提前结束该局。")
+                        # 打印关键状态快照
+                        try:
+                            gs = self.env.game_state
+                            print(f"[状态] phase={getattr(gs,'phase',None)} cur={getattr(gs,'current_player',None)} tiles_remaining={getattr(gs,'tiles_remaining',None)} pending={len(getattr(gs,'pending_responses',[]))} last_discard={getattr(gs,'last_discard',None)}")
+                        except Exception:
+                            pass
+                    break
+
+                # 若环境标记任一智能体终止，则认为该局已结束
+                if any(self.env.terminations.values()):
                     break
 
                 current_agent = self.env.agent_selection
                 action_mask = obs["action_mask"]
+                if np.asarray(action_mask).sum() <= 0:
+                    if verbose and not warned_zero_mask:
+                        print("[警告] action_mask 全为0，提前结束该局以避免卡死。")
+                        warned_zero_mask = True
+                    break
 
-                # 获取动作
+                # 获取动作（确定性路径：直接前向 + 掩码 + argmax，避免分布/对数概率计算开销）
                 torch_obs = self._numpy_obs_to_torch(obs)
                 torch_action_mask = (
                     torch.from_numpy(action_mask).unsqueeze(0).to(self.device)
                 )
 
                 with torch.no_grad():
-                    action, _, _, _ = self.model.get_action_and_value(
-                        torch_obs,
-                        action_mask=torch_action_mask,
-                        deterministic=deterministic,
-                    )
+                    logits, _value = self.model.forward(torch_obs)
+                    logits = torch.nan_to_num(logits, nan=0.0, posinf=1e9, neginf=-1e9)
+                    logits = logits.clamp(min=-50.0, max=50.0)
+                    masked_logits = logits.masked_fill(torch_action_mask == 0, -1e9)
+                    action = masked_logits.argmax(dim=-1)
 
                 # 执行动作
                 self.env.step(action.cpu().item())
@@ -128,6 +175,14 @@ class MahjongEvaluator:
                     episode_reward_acc[agent] += self.env.rewards.get(agent, 0.0)
 
                 episode_length += 1
+
+                # 诊断打印（每200步输出一次状态，便于定位卡点）
+                if verbose and (episode_length % 400 == 0):
+                    try:
+                        gs = self.env.game_state
+                        print(f"[诊断] step={episode_length} phase={gs.phase} cur={gs.current_player} tiles_remaining={gs.tiles_remaining} pending={len(gs.pending_responses)}")
+                    except Exception:
+                        pass
 
                 # 获取下一个观测
                 if self.env.agent_selection is not None:
@@ -186,7 +241,7 @@ class MahjongEvaluator:
 
         return results
 
-    def play_interactive(self, render: bool = True):
+    def play_interactive(self, render: bool = True, max_steps: int = 0):
         """
         交互式游戏（人类可以观察AI如何决策）
 
@@ -200,23 +255,47 @@ class MahjongEvaluator:
         obs, info = self.env.reset()
         step = 0
 
+        warned_zero_mask = False
         while True:
+            # 终局/异常保护
+            if getattr(self.env, "game_state", None) is not None:
+                if getattr(self.env.game_state, "phase", None) == "end":
+                    break
             if self.env.agent_selection is None:
+                break
+            if max_steps > 0 and step >= max_steps:
+                print(f"[警告] 交互演示步数超过上限 {max_steps}，提前结束。")
+                break
+
+            # 若环境标记任一智能体终止，则认为该局已结束
+            if any(self.env.terminations.values()):
                 break
 
             current_agent = self.env.agent_selection
             action_mask = obs["action_mask"]
+            if np.asarray(action_mask).sum() <= 0:
+                if not warned_zero_mask:
+                    print("[警告] action_mask 全为0，提前结束以避免卡死。")
+                    warned_zero_mask = True
+                break
 
-            # 获取AI动作
+            # 获取AI动作（交互：使用采样概率展示，但避免 log_prob 计算卡顿，改为 softmax 概率）
             torch_obs = self._numpy_obs_to_torch(obs)
             torch_action_mask = (
                 torch.from_numpy(action_mask).unsqueeze(0).to(self.device)
             )
 
             with torch.no_grad():
-                action, log_prob, _, value = self.model.get_action_and_value(
-                    torch_obs, action_mask=torch_action_mask, deterministic=False
-                )
+                logits, value = self.model.forward(torch_obs)
+                logits = torch.nan_to_num(logits, nan=0.0, posinf=1e9, neginf=-1e9)
+                logits = logits.clamp(min=-50.0, max=50.0)
+                masked_logits = logits.masked_fill(torch_action_mask == 0, -1e9)
+                if masked_logits.dtype.is_floating_point:
+                    probs = torch.softmax(masked_logits, dim=-1)
+                else:
+                    probs = None
+                # 采样或贪心，这里与训练一致可取采样；为稳定可使用贪心
+                action = masked_logits.argmax(dim=-1)
 
             # 解码动作
             from mahjong_environment.utils.action_encoder import ActionEncoder
@@ -227,7 +306,12 @@ class MahjongEvaluator:
             print(f"\n【步骤 {step}】 当前玩家: {current_agent}")
             print(f"  动作: {action_type} {params}")
             print(f"  价值估计: {value.cpu().item():.3f}")
-            print(f"  动作概率: {torch.exp(log_prob).cpu().item():.3f}")
+            try:
+                sel_prob = probs[0, action.item()].cpu().item() if probs is not None else None
+            except Exception:
+                sel_prob = None
+            if sel_prob is not None:
+                print(f"  动作概率: {sel_prob:.3f}")
 
             # 执行动作
             self.env.step(action.cpu().item())
