@@ -314,21 +314,33 @@ class MahjongActorCritic(nn.Module):
         )
         action_logits = action_logits.clamp(min=-50.0, max=50.0)
 
-        # 应用动作掩码
+        # 应用动作掩码（统一为bool并与logits设备/形状对齐）
         if action_mask is not None:
+            mask = action_mask
+            if mask.dtype.is_floating_point:
+                mask = mask > 0.5
+            else:
+                mask = mask != 0
+            mask = mask.to(device=action_logits.device)
+
             # 将非法动作的logits设置为极小值
-            masked_logits = action_logits.masked_fill(action_mask == 0, -1e9)
+            masked_logits = action_logits.masked_fill(~mask, -1e9)
 
             # 处理极端情况：如果没有任何合法动作，回退到选择索引0
-            if action_mask.dim() == 2:
-                invalid_rows = action_mask.sum(dim=-1) == 0
+            if mask.dim() == 2:
+                valid_counts = mask.sum(dim=-1)
+                invalid_rows = valid_counts == 0
                 if invalid_rows.any():
                     masked_logits[invalid_rows, 0] = 0.0
             else:
-                if action_mask.sum() == 0:
+                if mask.sum() == 0:
                     masked_logits[..., 0] = 0.0
 
             action_logits = masked_logits
+
+        # 在构建分布前使用float32，避免在AMP(bfloat16)下的分布计算异常
+        if action_logits.dtype != torch.float32:
+            action_logits = action_logits.float()
 
         # 创建分类分布
         dist = Categorical(logits=action_logits)
