@@ -41,9 +41,16 @@ class PPOUpdater:
 
         # 优化器
         if optimizer is None:
-            self.optimizer = optim.Adam(
-                model.parameters(), lr=config.learning_rate, eps=1e-5
-            )
+            try:
+                # 尝试使用 fused Adam（PyTorch自带/torch.optim中在CUDA可用）
+                self.optimizer = optim.Adam(
+                    model.parameters(), lr=config.learning_rate, eps=1e-5, fused=True
+                )
+                print("已启用 fused Adam 优化器")
+            except TypeError:
+                self.optimizer = optim.Adam(
+                    model.parameters(), lr=config.learning_rate, eps=1e-5
+                )
         else:
             self.optimizer = optimizer
 

@@ -16,6 +16,10 @@ from mahjong_environment.game_state import GameState
 from mahjong_environment.utils.action_encoder import ActionEncoder
 from mahjong_environment.utils.tile_utils import normalize_tile, tiles_are_same
 from mahjong_scorer.main_scorer import MainScorer
+try:
+    from mahjong_environment.fastops import FASTOPS_AVAILABLE, compute_fast_actions
+except Exception:
+    FASTOPS_AVAILABLE = False
 
 
 class LegalActionsHelper:
@@ -43,6 +47,45 @@ class LegalActionsHelper:
 
         player = game_state.players[player_id]
         phase = game_state.phase
+
+        # 快速路径：训练期可用Cython近似掩码（显著加速）；评估/交互应将 game_state.fast_mask 设为 False
+        if FASTOPS_AVAILABLE and getattr(game_state, "fast_mask", True):
+            # phase_info: [is_turn, is_discard, is_response]
+            is_discard = int(phase == "discard")
+            is_response = int(phase == "response")
+            phase_code = 1 if is_discard else (2 if is_response else 0)
+            # 准备 hand34 / drawn34 / riichi4
+            hand34 = player.get_tile_count_34()
+            drawn34 = [0]*34
+            if player.drawn_tile:
+                try:
+                    idx = player._tile_to_index(player.drawn_tile)
+                    if idx >= 0:
+                        drawn34[idx] = 1
+                except Exception:
+                    pass
+            riichi4 = [int(p.is_riichi) for p in game_state.players]
+            last_idx = -1
+            if getattr(game_state, "last_discard", None):
+                try:
+                    last_idx = player._tile_to_index(game_state.last_discard)
+                except Exception:
+                    last_idx = -1
+            last_player = getattr(game_state, "last_discard_player", -1)
+
+            try:
+                mask_np = compute_fast_actions(
+                    np.asarray(hand34, dtype=np.int8),
+                    np.asarray(drawn34, dtype=np.int8),
+                    np.asarray(riichi4, dtype=np.int8),
+                    phase_code, int(player_id), int(last_idx), int(last_player)
+                )
+                # 回填为布尔列表
+                action_mask = [bool(int(x)) for x in np.asarray(mask_np, dtype=np.int8)]
+                # 训练时仅依赖掩码，直接返回以避免后续昂贵的精确判定
+                return [], action_mask
+            except Exception:
+                pass
 
         if phase == "discard":
             # 打牌阶段：可以打出手中的任何一张牌
@@ -85,7 +128,7 @@ class LegalActionsHelper:
                 # 总是可以跳过
                 legal_actions.append(ActionEncoder.PASS)
 
-        # 将合法动作转换为掩码
+        # 将合法动作转换为掩码（精确路径覆盖快速路径）
         for action in legal_actions:
             if 0 <= action < ActionEncoder.NUM_ACTIONS:
                 action_mask[action] = True

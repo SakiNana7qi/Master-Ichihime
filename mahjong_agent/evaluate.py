@@ -104,13 +104,15 @@ class MahjongEvaluator:
         Returns:
             评估统计信息
         """
-        # 统计信息
+        # 统计信息（不再统计win概率，改为马点/终局积分表现）
         episode_rewards = {f"player_{i}": [] for i in range(4)}
         episode_lengths = []
         final_scores = {f"player_{i}": [] for i in range(4)}
-
-        wins = {f"player_{i}": 0 for i in range(4)}
-        win_types = {"ron": 0, "tsumo": 0, "draw": 0}
+        # 马点（uma）结果：默认使用四人场 [15, 5, -5, -15]，单位千点
+        uma_table = [15, 5, -5, -15]
+        base_points = 25000  # 起始分
+        oka = 0  # 雀魂通常不加oka，这里默认0（如需变更可在此调整）
+        player_uma = {f"player_{i}": [] for i in range(4)}
 
         iterator = (
             tqdm(range(num_episodes), desc="评估中") if verbose else range(num_episodes)
@@ -214,20 +216,19 @@ class MahjongEvaluator:
                     self.env.game_state.players[player_idx].score
                 )
 
-            # 记录胜者
-            if self.env.game_state.round_result:
-                result = self.env.game_state.round_result
-                if result.winner is not None:
-                    winner_agent = f"player_{result.winner}"
-                    wins[winner_agent] += 1
-
-                    # 记录胜利类型
-                    if result.result_type == "ron":
-                        win_types["ron"] += 1
-                    elif result.result_type == "tsumo":
-                        win_types["tsumo"] += 1
-                else:
-                    win_types["draw"] += 1
+            # 计算该局马点（基于终局分与排名）
+            scores_now = [self.env.game_state.players[i].score for i in range(4)]
+            # 排名（高分排前）
+            order = sorted(range(4), key=lambda x: scores_now[x], reverse=True)
+            # 分差换算千点
+            diff_k = [(s - base_points) / 1000.0 for s in scores_now]
+            # 分配uma
+            rank_to_uma = {order[r]: uma_table[r] for r in range(4)}
+            # oka 分配（此处默认0，若设置>0通常全部给第一名，按需更改）
+            rank_to_oka = {order[0]: oka, order[1]: 0, order[2]: 0, order[3]: 0}
+            for pid in range(4):
+                uma_value = diff_k[pid] + rank_to_uma[pid] + rank_to_oka[pid]
+                player_uma[f"player_{pid}"].append(uma_value)
 
         # 计算统计结果
         results = {
@@ -243,17 +244,11 @@ class MahjongEvaluator:
             results[prefix + "std_reward"] = np.std(episode_rewards[agent])
             results[prefix + "mean_score"] = np.mean(final_scores[agent])
             results[prefix + "std_score"] = np.std(final_scores[agent])
-            results[prefix + "win_rate"] = wins[agent] / num_episodes
-
-        # 胜利类型统计
-        results["ron_rate"] = win_types["ron"] / num_episodes
-        results["tsumo_rate"] = win_types["tsumo"] / num_episodes
-        results["draw_rate"] = win_types["draw"] / num_episodes
-
-        # player_0（主要评估对象）的性能
-        results["player_0_performance"] = (
-            results["player_0_mean_reward"] + results["player_0_win_rate"] * 10
-        )
+            # 追加马点统计
+            results[prefix + "mean_uma"] = np.mean(player_uma[agent])
+            results[prefix + "std_uma"] = np.std(player_uma[agent])
+        # player_0（主要评估对象）的综合性能（以马点为主）
+        results["player_0_performance"] = results["player_0_mean_uma"]
 
         return results
 
@@ -391,16 +386,12 @@ class MahjongEvaluator:
         Returns:
             基准测试结果
         """
-        print(f"\n对战随机策略 ({num_episodes}局)...")
+        print(f"\n基于终局马点的评估（{num_episodes}局）...")
         results = self.evaluate(num_episodes=num_episodes, verbose=True)
 
         print("\n基准测试结果:")
-        print(f"  player_0 平均奖励: {results['player_0_mean_reward']:.3f}")
-        print(f"  player_0 胜率: {results['player_0_win_rate']:.2%}")
+        print(f"  player_0 平均马点: {results['player_0_mean_uma']:.2f} 千点")
         print(f"  player_0 平均分数: {results['player_0_mean_score']:.1f}")
-        print(f"  荣和率: {results['ron_rate']:.2%}")
-        print(f"  自摸率: {results['tsumo_rate']:.2%}")
-        print(f"  流局率: {results['draw_rate']:.2%}")
 
         return results
 

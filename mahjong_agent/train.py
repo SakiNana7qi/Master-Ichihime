@@ -98,6 +98,7 @@ class MahjongTrainer:
                 pin_cpu_affinity=pin_affinity,
                 cpu_core_limit=getattr(self.config, "cpu_core_limit", None),
                 cores_per_proc=getattr(self.config, "cores_per_proc", None),
+                use_shared_memory=getattr(self.config, "use_shared_memory", False),
             )
             self.env = None
             print(f"多进程环境初始化完成")
@@ -136,6 +137,14 @@ class MahjongTrainer:
         # 加载检查点
         if checkpoint_path is not None:
             self.load_checkpoint(checkpoint_path)
+
+        # 在CUDA上使用 torch.compile 提升吞吐（需要PyTorch>=2.1）
+        try:
+            if self.device.type == "cuda":
+                self.model = torch.compile(self.model, mode="max-autotune")
+                print("已启用 torch.compile (max-autotune)")
+        except Exception:
+            pass
 
         print("训练器初始化完成！")
 
@@ -201,8 +210,11 @@ class MahjongTrainer:
         prof = getattr(self, "_prof", {"env_step": 0.0, "model_infer": 0.0, "ipc": 0.0})
         loop_start = _t.time()
 
-        # 收集rollout_steps步的数据
-        for step in range(self.config.rollout_steps):
+        # 采样直至缓冲区填满（并行环境下为 rollout_steps * num_envs）
+        step = 0
+        target_size = self.rollout_buffer.buffer_size
+        safety_loops = 0
+        while self.rollout_buffer.pos < target_size:
             # 检查游戏是否结束
             if self.vec_env is None and self.env.agent_selection is None:
                 # 保存episode统计
@@ -217,12 +229,12 @@ class MahjongTrainer:
 
             if self.vec_env is not None:
                 # 并行分支：构造批次推理，并将每个子环境样本写入buffer
-                # 填充预分配的批次缓冲
-                for i in range(self.num_envs):
-                    o = obs_list[i]
-                    for k in np_obs_batch:
-                        _np.copyto(np_obs_batch[k][i], _np.asarray(o[k]))
-                    _np.copyto(action_masks_np[i], _np.asarray(o["action_mask"]))
+                # 采用一次性堆叠替代逐环境copy，降低Python循环开销
+                # 如果 vec_env 使用共享内存，obs_list 内部已是视图，尽量避免额外复制
+                for k in np_obs_batch:
+                    arrs = obs_list  # list of dict
+                    np_obs_batch[k][...] = _np.asarray([a[k] for a in arrs], dtype=np_obs_batch[k].dtype)
+                action_masks_np[...] = _np.asarray([a["action_mask"] for a in obs_list], dtype=action_masks_np.dtype)
 
                 # 将CPU批次拷贝到GPU张量（非阻塞）
                 for k in torch_obs_batch:
@@ -342,6 +354,11 @@ class MahjongTrainer:
             # 渲染（如果需要）
             if self.config.render_training and step % 50 == 0:
                 self.env.render()
+            step += 1
+            safety_loops += 1
+            if safety_loops > target_size * 4:
+                print("[警告] 采样循环异常耗时，提前退出本轮以避免死锁。", flush=True)
+                break
 
         # 计算最后一个状态的价值（用于bootstrap）
         if self.vec_env is None and self.env.agent_selection is not None:
@@ -411,6 +428,8 @@ class MahjongTrainer:
         print(f"预计迭代次数: {total_updates}")
         print("=" * 80 + "\n")
 
+        # 记录会话起始步数（用于正确计算FPS，避免从checkpoint恢复导致虚高）
+        self._session_start_step = self.global_step
         start_time = time.time()
 
         # 主训练循环（带进度条）
@@ -463,7 +482,7 @@ class MahjongTrainer:
     def _log_stats(self, stats: Dict[str, float], start_time: float):
         """记录训练统计信息"""
         elapsed_time = time.time() - start_time
-        fps = self.global_step / elapsed_time
+        fps = (self.global_step - getattr(self, "_session_start_step", 0)) / max(1e-9, elapsed_time)
 
         # 控制台输出
         if self.config.verbose:
@@ -553,11 +572,13 @@ class MahjongTrainer:
         wins = 0
 
         for _ in range(num_episodes):
-            obs, info = eval_env.reset()
+            # 每局使用不同的随机种子，确保庄位/座位随机
+            obs, info = eval_env.reset(seed=self.config.seed + _)
             episode_reward = 0
             episode_length = 0
             done = False
             max_steps = 2000  # 安全上限，避免环境异常导致死循环
+            p0_total_reward = 0.0  # 累计 player_0 的总奖励用于判断胜负
 
             while not done and episode_length < max_steps:
                 # 终局保护：有些环境在结束时不会立刻将 agent_selection 置为 None
@@ -584,6 +605,8 @@ class MahjongTrainer:
                 eval_env.step(action.cpu().item())
 
                 reward = eval_env.rewards.get(current_agent, 0.0)
+                # 累计 player_0 的奖励（不论当前是谁在行动）
+                p0_total_reward += float(eval_env.rewards.get("player_0", 0.0))
                 done = eval_env.terminations.get(current_agent, False)
 
                 episode_reward += reward
@@ -595,8 +618,8 @@ class MahjongTrainer:
             episode_rewards.append(episode_reward)
             episode_lengths.append(episode_length)
 
-            # 检查是否获胜（player_0的奖励最高）
-            if eval_env.rewards.get("player_0", 0) > 0:
+            # 根据累计奖励判断是否胜利（更稳健，避免最后一步读取为0导致漏计）
+            if p0_total_reward > 0:
                 wins += 1
 
         return {
@@ -622,15 +645,74 @@ class MahjongTrainer:
 
     def load_checkpoint(self, path: str):
         """加载检查点"""
-        checkpoint = torch.load(path, map_location=self.device)
-        self.model.load_state_dict(checkpoint["model_state_dict"])
-        self.ppo_updater.optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
-        self.global_step = checkpoint["global_step"]
-        self.rollout_count = checkpoint["rollout_count"]
-        self.episode_count = checkpoint["episode_count"]
-        print(f"已加载检查点: {path}")
-        print(f"  全局步数: {self.global_step}")
-        print(f"  Rollout次数: {self.rollout_count}")
+        # 兼容 PyTorch 2.6 的 weights_only 行为变化；优先完整加载，失败时回退仅权重
+        try:
+            try:
+                # 允许 PPOConfig 作为安全类型
+                torch.serialization.add_safe_globals([PPOConfig])
+            except Exception:
+                pass
+
+            checkpoint = torch.load(
+                path, map_location=self.device, weights_only=False
+            )
+
+            state_dict = checkpoint.get("model_state_dict", checkpoint)
+            # 若模型已被compile包装，内部真实模块为 _orig_mod
+            if hasattr(self.model, "_orig_mod") and isinstance(state_dict, dict):
+                try:
+                    # 将普通键映射到 _orig_mod.* 键名
+                    renamed = {}
+                    for k, v in state_dict.items():
+                        if not k.startswith("_orig_mod."):
+                            renamed[f"_orig_mod.{k}"] = v
+                        else:
+                            renamed[k] = v
+                    self.model.load_state_dict(renamed, strict=False)
+                except Exception:
+                    self.model.load_state_dict(state_dict, strict=False)
+            else:
+                self.model.load_state_dict(state_dict, strict=False)
+
+            opt_state = checkpoint.get("optimizer_state_dict", None)
+            if opt_state is not None:
+                self.ppo_updater.optimizer.load_state_dict(opt_state)
+
+            # 训练进度（可选字段）
+            self.global_step = checkpoint.get("global_step", self.global_step)
+            self.rollout_count = checkpoint.get("rollout_count", self.rollout_count)
+            self.episode_count = checkpoint.get("episode_count", self.episode_count)
+
+            # 若检查点内包含配置，采用之（保留外部覆盖项）
+            loaded_cfg = checkpoint.get("config", None)
+            if loaded_cfg is not None:
+                self.config = loaded_cfg
+
+            print(f"已加载检查点(完整): {path}")
+            print(f"  全局步数: {self.global_step}")
+            print(f"  Rollout次数: {self.rollout_count}")
+        except Exception as e:
+            print(f"[警告] 完整加载失败，尝试仅加载权重: {e}")
+            state = torch.load(path, map_location=self.device, weights_only=True)
+            # 兼容两种保存格式：1) 全字典 2) 直接state_dict
+            model_state = state.get("model_state_dict", state) if isinstance(state, dict) else state
+            if hasattr(self.model, "_orig_mod") and isinstance(model_state, dict):
+                renamed = {}
+                for k, v in model_state.items():
+                    if not k.startswith("_orig_mod."):
+                        renamed[f"_orig_mod.{k}"] = v
+                    else:
+                        renamed[k] = v
+                self.model.load_state_dict(renamed, strict=False)
+            else:
+                self.model.load_state_dict(model_state, strict=False)
+            opt_state = state.get("optimizer_state_dict") if isinstance(state, dict) else None
+            if isinstance(opt_state, dict):
+                try:
+                    self.ppo_updater.optimizer.load_state_dict(opt_state)
+                except Exception:
+                    print("[提示] 优化器状态不兼容，已跳过加载优化器。")
+            print(f"已加载检查点(仅权重): {path}")
 
 
 def main():
@@ -653,6 +735,12 @@ def main():
     parser.add_argument("--cpu-core-limit", type=int, default=0, help="限制可用CPU核心数（0表示不限制）")
     parser.add_argument("--num-envs", type=int, default=0, help="并行环境数（0表示使用配置默认值）")
     parser.add_argument("--profile", action="store_true", help="输出训练阶段耗时剖析")
+    parser.add_argument("--rollout-steps", type=int, default=0, help="覆盖配置的rollout_steps")
+    parser.add_argument("--mini-batch-size", type=int, default=0, help="覆盖配置的mini_batch_size")
+    parser.add_argument("--num-epochs", type=int, default=0, help="覆盖配置的num_epochs")
+    parser.add_argument("--eval-interval", type=int, default=0, help="覆盖配置的eval_interval（>0生效）")
+    parser.add_argument("--no-eval", action="store_true", help="训练期间禁用评估")
+    parser.add_argument("--cores-per-proc", type=int, default=0, help="每个子进程分配的CPU核心数（0表示自动）")
 
     args = parser.parse_args()
 
@@ -688,6 +776,19 @@ def main():
         config.num_envs = args.num_envs
     if args.profile:
         config.profile_timing = True
+    if args.rollout_steps and args.rollout_steps > 0:
+        config.rollout_steps = args.rollout_steps
+    if args.mini_batch_size and args.mini_batch_size > 0:
+        config.mini_batch_size = args.mini_batch_size
+    if args.num_epochs and args.num_epochs > 0:
+        config.num_epochs = args.num_epochs
+    if args.no_eval:
+        # 通过设置极大间隔来禁用评估
+        config.eval_interval = 10**9
+    elif args.eval_interval and args.eval_interval > 0:
+        config.eval_interval = args.eval_interval
+    if args.cores_per_proc and args.cores_per_proc > 0:
+        config.cores_per_proc = args.cores_per_proc
 
     # 创建训练器并开始训练
     trainer = MahjongTrainer(config=config, checkpoint_path=args.checkpoint)

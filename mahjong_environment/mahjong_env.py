@@ -17,6 +17,11 @@ from .utils.meld_helper import MeldHelper
 from mahjong_scorer.main_scorer import MainScorer
 from mahjong_scorer.utils.structures import HandInfo, GameState as ScorerGameState
 
+try:
+    from .fastops import FASTOPS_AVAILABLE, build_observation_i8_f32
+except Exception:
+    FASTOPS_AVAILABLE = False
+
 
 class MahjongEnv:
     """
@@ -76,6 +81,12 @@ class MahjongEnv:
 
         # 上一次观测的缓存
         self._last_observations: Dict[str, Any] = {}
+        # 预分配一个动作掩码缓冲，减少频繁分配（备用，不强制使用）
+        try:
+            from .utils.action_encoder import ActionEncoder as _AE
+            self._prealloc_action_mask = np.zeros(_AE.NUM_ACTIONS, dtype=np.int8)
+        except Exception:
+            self._prealloc_action_mask = None
 
     def _define_observation_space(self):
         """定义观测空间"""
@@ -135,8 +146,22 @@ class MahjongEnv:
         self.agents = self.possible_agents.copy()
 
         # 创建新的游戏状态
+        # 随机场风与自风：给 GameState 一个新种子，使 round_wind 也随机
         self.game_state = GameState(seed=self.seed)
+        # 在初始化前扰动一遍 RNG 以随机场风（需 GameState 支持随机场风选择）
+        try:
+            import random as _rnd
+            _ = _rnd.random()
+        except Exception:
+            pass
         self.game_state.init_round()
+
+        # 预计算/累计型观测缓存（避免每步全量重扫Python列表）
+        # rivers_counts[i, t]: 第i位玩家牌河中第t种牌的枚举
+        # melds_counts[i, t]: 第i位玩家副露中第t种牌的枚举
+        self._rivers_counts = np.zeros((4, 34), dtype=np.int8)
+        self._melds_counts = np.zeros((4, 34), dtype=np.int8)
+        self._riichi_status_cache = np.zeros(4, dtype=np.int8)
 
         # 重置累计信息
         self.rewards = {agent: 0.0 for agent in self.possible_agents}
@@ -227,29 +252,19 @@ class MahjongEnv:
                 self.game_state.phase = "discard"
 
         # 构建观测
-        obs = {}
-
-        # 1. 手牌 (34维)
-        obs["hand"] = np.array(player.get_tile_count_34(), dtype=np.int8)
-
-        # 2. 刚摸到的牌 (34维one-hot)
+        # 先构造Python端必要数组
+        hand = np.array(player.get_tile_count_34(), dtype=np.int8)
         drawn_tile_vec = np.zeros(34, dtype=np.int8)
         if player.drawn_tile:
             idx = player._tile_to_index(player.drawn_tile)
             if idx != -1:
                 drawn_tile_vec[idx] = 1
-        obs["drawn_tile"] = drawn_tile_vec
-
-        # 3. 牌河信息 (4x34)
         rivers = np.zeros((4, 34), dtype=np.int8)
         for i, p in enumerate(self.game_state.players):
             for tile in p.river:
                 idx = p._tile_to_index(tile)
                 if idx != -1:
                     rivers[i][idx] += 1
-        obs["rivers"] = rivers
-
-        # 4. 副露信息 (4x34)
         melds = np.zeros((4, 34), dtype=np.int8)
         for i, p in enumerate(self.game_state.players):
             for meld in p.open_melds:
@@ -257,69 +272,81 @@ class MahjongEnv:
                     idx = p._tile_to_index(tile)
                     if idx != -1:
                         melds[i][idx] += 1
-        obs["melds"] = melds
-
-        # 5. 立直状态 (4维)
         riichi_status = np.array(
             [int(p.is_riichi) for p in self.game_state.players], dtype=np.int8
         )
-        obs["riichi_status"] = riichi_status
-
-        # 6. 分数 (4维，归一化)
         scores = np.array(
             [p.score / 100000.0 for p in self.game_state.players], dtype=np.float32
         )
-        obs["scores"] = scores
-
-        # 7. 宝牌指示牌 (5x34)
         dora_indicators = np.zeros((5, 34), dtype=np.int8)
         for i, dora in enumerate(self.game_state.dora_indicators[:5]):
             idx = player._tile_to_index(dora)
             if idx != -1:
                 dora_indicators[i][idx] = 1
-        obs["dora_indicators"] = dora_indicators
-
-        # 8. 场况信息
         wind_map = {"east": 0, "south": 1, "west": 2, "north": 3}
         game_info = np.array(
             [
-                wind_map[self.game_state.round_wind] / 3.0,  # 场风
-                wind_map[player.seat_wind] / 3.0,  # 自风
-                min(self.game_state.honba / 10.0, 1.0),  # 本场数
-                min(self.game_state.riichi_sticks / 4.0, 1.0),  # 立直棒
-                self.game_state.tiles_remaining / 70.0,  # 剩余牌数
+                wind_map[self.game_state.round_wind] / 3.0,
+                wind_map[player.seat_wind] / 3.0,
+                min(self.game_state.honba / 10.0, 1.0),
+                min(self.game_state.riichi_sticks / 4.0, 1.0),
+                self.game_state.tiles_remaining / 70.0,
             ],
             dtype=np.float32,
         )
-        obs["game_info"] = game_info
-
-        # 9. 阶段信息
         phase_info = np.array(
             [
-                int(self.agent_selection == agent),  # 是否轮到自己
-                int(self.game_state.phase == "discard"),  # 是否打牌阶段
-                int(self.game_state.phase == "response"),  # 是否响应阶段
+                int(self.agent_selection == agent),
+                int(self.game_state.phase == "discard"),
+                int(self.game_state.phase == "response"),
             ],
             dtype=np.int8,
         )
-        obs["phase_info"] = phase_info
-
-        # 10. 动作掩码
         _, action_mask = self.legal_actions_helper.get_legal_actions(
             player_id, self.game_state
         )
         from .utils.action_encoder import ActionEncoder as _AE
-        # 防御：在非响应阶段，确保 PASS 不可选
         if self.game_state.phase != "response":
             if 0 <= _AE.PASS < len(action_mask):
                 action_mask[_AE.PASS] = False
-        # 防御：在响应阶段但该玩家不在待响应列表时，允许 PASS 以推进
         else:
             if player_id not in self.game_state.pending_responses and 0 <= _AE.PASS < len(action_mask):
                 action_mask[_AE.PASS] = True
-        obs["action_mask"] = np.array(action_mask, dtype=np.int8)
+        mask = np.array(action_mask, dtype=np.int8)
 
-        return obs
+        if FASTOPS_AVAILABLE:
+            i8, f32 = build_observation_i8_f32(
+                hand, drawn_tile_vec, rivers, melds, riichi_status, dora_indicators,
+                scores, game_info, phase_info, mask
+            )
+            # 回填为原字典格式（保持上层兼容；尽量避免不必要复制）
+            off = 0
+            obs = {}
+            obs["hand"] = i8[off:off+34]; off += 34
+            obs["drawn_tile"] = i8[off:off+34]; off += 34
+            obs["rivers"] = i8[off:off+136].reshape(4,34); off += 136
+            obs["melds"] = i8[off:off+136].reshape(4,34); off += 136
+            obs["riichi_status"] = i8[off:off+4]; off += 4
+            obs["dora_indicators"] = i8[off:off+170].reshape(5,34); off += 170
+            obs["phase_info"] = i8[off:off+3]; off += 3
+            obs["action_mask"] = i8[off:off+mask.shape[0]]
+            foff = 0
+            obs["scores"] = f32[foff:foff+4]; foff += 4
+            obs["game_info"] = f32[foff:foff+5]; foff += 5
+            return obs
+        else:
+            return {
+                "hand": hand,
+                "drawn_tile": drawn_tile_vec,
+                "rivers": rivers,
+                "melds": melds,
+                "riichi_status": riichi_status,
+                "scores": scores,
+                "dora_indicators": dora_indicators,
+                "game_info": game_info,
+                "phase_info": phase_info,
+                "action_mask": mask,
+            }
 
     def render(self):
         """渲染当前游戏状态"""
@@ -456,6 +483,9 @@ class MahjongEnv:
         # 如果是立直打牌
         if with_riichi:
             self.game_state.apply_riichi(player_id)
+            # 更新立直缓存
+            if hasattr(self, "_riichi_status_cache"):
+                self._riichi_status_cache[player_id] = 1
 
         # 判断是否为摸切
         is_tsumogiri = tile == player.drawn_tile
@@ -467,7 +497,19 @@ class MahjongEnv:
             fallback_tile = player.drawn_tile if player.drawn_tile else (player.hand[0] if player.hand else "")
             if fallback_tile:
                 is_tsumogiri_fb = fallback_tile == player.drawn_tile
-                self.game_state.discard_tile(player_id, fallback_tile, is_tsumogiri_fb)
+                # 记录真正打出的牌用于河计数
+                actually = fallback_tile
+                self.game_state.discard_tile(player_id, actually, is_tsumogiri_fb)
+                if hasattr(self, "_rivers_counts"):
+                    idx = player._tile_to_index(actually)
+                    if idx != -1:
+                        self._rivers_counts[player_id, idx] = min(24, self._rivers_counts[player_id, idx] + 1)
+        else:
+            # 记录到河计数
+            if hasattr(self, "_rivers_counts"):
+                idx = player._tile_to_index(tile)
+                if idx != -1:
+                    self._rivers_counts[player_id, idx] = min(24, self._rivers_counts[player_id, idx] + 1)
 
         # 进入响应阶段，询问其他玩家是否要鸣牌/和牌
         self.game_state.phase = "response"
@@ -482,6 +524,11 @@ class MahjongEnv:
             return
         is_tsumogiri = tile == player.drawn_tile
         self.game_state.discard_tile(player_id, tile, is_tsumogiri)
+        # 记录到河计数
+        if hasattr(self, "_rivers_counts"):
+            idx = player._tile_to_index(tile)
+            if idx != -1:
+                self._rivers_counts[player_id, idx] = min(24, self._rivers_counts[player_id, idx] + 1)
         # 进入响应阶段
         self.game_state.phase = "response"
         self.game_state.pending_responses = [i for i in range(4) if i != player_id]
@@ -511,6 +558,12 @@ class MahjongEnv:
 
         # 添加副露
         player.add_meld(meld)
+        # 更新副露计数缓存
+        if hasattr(self, "_melds_counts"):
+            for t in meld.tiles:
+                idx = player._tile_to_index(t)
+                if idx != -1:
+                    self._melds_counts[player_id, idx] = min(4, self._melds_counts[player_id, idx] + 1)
 
         # 吃牌后，轮到该玩家（不摸牌），立刻打出一张
         self.game_state.current_player = player_id
@@ -548,6 +601,12 @@ class MahjongEnv:
 
         # 添加副露
         player.add_meld(meld)
+        # 更新副露计数缓存
+        if hasattr(self, "_melds_counts"):
+            for t in meld.tiles:
+                idx = player._tile_to_index(t)
+                if idx != -1:
+                    self._melds_counts[player_id, idx] = min(4, self._melds_counts[player_id, idx] + 1)
 
         # 碰牌后，轮到该玩家（不摸牌），立刻打出一张
         self.game_state.current_player = player_id
@@ -584,6 +643,12 @@ class MahjongEnv:
 
         # 添加副露
         player.add_meld(meld)
+        # 更新副露计数缓存
+        if hasattr(self, "_melds_counts"):
+            for t in meld.tiles:
+                idx = player._tile_to_index(t)
+                if idx != -1:
+                    self._melds_counts[player_id, idx] = min(4, self._melds_counts[player_id, idx] + 1)
 
         # 明杠后，翻开新的宝牌指示牌
         self.game_state.reveal_dora()
@@ -631,6 +696,12 @@ class MahjongEnv:
 
         # 添加副露
         player.add_meld(meld)
+        # 更新副露计数缓存
+        if hasattr(self, "_melds_counts"):
+            for t in meld.tiles:
+                idx = player._tile_to_index(t)
+                if idx != -1:
+                    self._melds_counts[player_id, idx] = min(4, self._melds_counts[player_id, idx] + 1)
 
         # 暗杠后，翻开新的宝牌指示牌
         self.game_state.reveal_dora()
@@ -661,8 +732,21 @@ class MahjongEnv:
         player.remove_tile(tile_to_remove)
 
         # 替换副露（移除碰，添加杠）
+        # 先从缓存移除原碰的计数
+        if hasattr(self, "_melds_counts"):
+            for t in original_pon.tiles:
+                idx = player._tile_to_index(t)
+                if idx != -1:
+                    # 防御下溢
+                    self._melds_counts[player_id, idx] = max(0, int(self._melds_counts[player_id, idx]) - 1)
         player.open_melds.remove(original_pon)
         player.add_meld(kakan_meld)
+        # 新加杠写入缓存
+        if hasattr(self, "_melds_counts"):
+            for t in kakan_meld.tiles:
+                idx = player._tile_to_index(t)
+                if idx != -1:
+                    self._melds_counts[player_id, idx] = min(4, self._melds_counts[player_id, idx] + 1)
 
         # 加杠后，翻开新的宝牌指示牌
         self.game_state.reveal_dora()

@@ -36,9 +36,11 @@ def get_multithread_config() -> PPOConfig:
         cpu_core_limit=None,  # 外部可覆盖为固定核心数（如36）
         # 可在外部设置：config.pin_cpu_affinity=True 启用Windows/Linux下子进程CPU亲和度分散
         # 采样与优化
-        rollout_steps=4096,  # 更大的rollout提升吞吐与稳定
-        mini_batch_size=2048,  # 更大的batch以提升GPU利用率（32环境时）
-        num_epochs=4,
+        rollout_steps=4096,  # 恢复较短的单次采样，缩短每次update时长
+        mini_batch_size=8192,  # 维持较大的训练batch以提升GPU利用率
+        num_epochs=2,  # 保持较少epoch减少重复前向
+        # 运行期性能开关
+        use_shared_memory=True,
         # 学习率与稳定性
         learning_rate=1e-4,
         clip_range=0.1,
@@ -49,9 +51,9 @@ def get_multithread_config() -> PPOConfig:
         num_hidden_layers=3,
         use_transformer=False,
         # 日志/评估频率
-        log_interval=2,
-        save_interval=20,
-        eval_interval=10,
+        log_interval=5,
+        save_interval=50,
+        eval_interval=50,
         # 其它
         device="cuda",
         seed=42,

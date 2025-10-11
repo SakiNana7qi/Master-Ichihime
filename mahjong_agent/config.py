@@ -85,6 +85,8 @@ class PPOConfig:
     pin_cpu_affinity: bool = False  # 是否为子进程设置CPU亲和度
     cpu_core_limit: int | None = None  # 限制可用CPU核心数（None表示不限制）
     cores_per_proc: Optional[int] = None  # 每个子进程绑定的核心数（None则自动计算）
+    # 运行期开关
+    use_shared_memory: bool = False  # 是否为并行环境启用共享内存通道
 
     # 路径
     save_dir: str = "./checkpoints"  # 模型保存路径
