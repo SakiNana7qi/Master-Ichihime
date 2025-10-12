@@ -137,7 +137,12 @@ def _env_worker(remote, parent_remote, seed: Optional[int], use_shm: bool,
                 break
             else:
                 raise RuntimeError(f"Unknown cmd: {cmd}")
-    except KeyboardInterrupt:
+    except (KeyboardInterrupt, EOFError, BrokenPipeError):
+        # 主进程退出或管道被关闭时，子进程优雅退出
+        try:
+            remote.close()
+        except Exception:
+            pass
         pass
 
 
@@ -190,7 +195,8 @@ class SubprocVecEnv:
             p = mp.Process(
                 target=_env_worker, args=(work_remote, remote, base_seed + idx, self.use_shared_memory, shm_specs)
             )
-            p.daemon = True
+            # 使用非守护进程，配合显式 close() 与 join() 以避免 Windows 下退出时的 BrokenPipe 噪声
+            p.daemon = False
             p.start()
             work_remote.close()
             self.processes.append(p)
@@ -361,8 +367,16 @@ class SubprocVecEnv:
             return
         for r in self.remotes:
             r.send(("close", None))
+        # 给予子进程更充足的时间退出
         for p in self.processes:
-            p.join(timeout=1)
+            p.join(timeout=5)
+        # 若仍有存活的子进程，强制终止
+        for p in self.processes:
+            if p.is_alive():
+                try:
+                    p.terminate()
+                except Exception:
+                    pass
         # 释放共享内存
         if self.use_shared_memory:
             try:

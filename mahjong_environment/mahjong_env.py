@@ -154,6 +154,20 @@ class MahjongEnv:
             _ = _rnd.random()
         except Exception:
             pass
+        # 使用可复现的随机源：根据传入seed随机庄家与（可选）场风
+        try:
+            import numpy as _np
+            _rng = _np.random.default_rng(self.seed if self.seed is not None else None)
+            # 随机庄家 [0..3]
+            self.game_state.dealer = int(_rng.integers(0, 4))
+            # 可选：随机场风（常规可保持东场，这里按需随机化以评估更客观）
+            winds = ["east", "south", "west", "north"]
+            self.game_state.round_wind = winds[int(_rng.integers(0, 4))]
+        except Exception:
+            # 兜底：若随机失败，仍使用默认dealer=0/round_wind=east
+            pass
+
+        # 初始化一局（根据上面写入的 dealer/round_wind 设置座风与发牌）
         self.game_state.init_round()
 
         # 预计算/累计型观测缓存（避免每步全量重扫Python列表）

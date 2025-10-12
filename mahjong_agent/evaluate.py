@@ -65,9 +65,24 @@ class MahjongEvaluator:
                 config = PPOConfig()
             loaded_step = "N/A"
 
+        # 兼容 torch.compile 保存的 _orig_mod.* 键名：去前缀
+        if isinstance(state_dict, dict):
+            try:
+                if any(isinstance(k, str) and k.startswith("_orig_mod.") for k in state_dict.keys()):
+                    stripped = {}
+                    for k, v in state_dict.items():
+                        if isinstance(k, str) and k.startswith("_orig_mod."):
+                            stripped[k[len("_orig_mod."):]] = v
+                        else:
+                            stripped[k] = v
+                    state_dict = stripped
+            except Exception:
+                pass
+
         self.config = config
         self.model = MahjongActorCritic(config).to(self.device)
-        self.model.load_state_dict(state_dict)
+        # 宽松加载以兼容不同版本/编译状态
+        self.model.load_state_dict(state_dict, strict=False)
         self.model.eval()
 
         print(f"已加载模型: {model_path}")
@@ -112,7 +127,30 @@ class MahjongEvaluator:
         uma_table = [15, 5, -5, -15]
         base_points = 25000  # 起始分
         oka = 0  # 雀魂通常不加oka，这里默认0（如需变更可在此调整）
-        player_uma = {f"player_{i}": [] for i in range(4)}
+        # 纯Uma(排名) 与 合成马点(分差+Uma)
+        player_uma_rank = {f"player_{i}": [] for i in range(4)}
+        player_uma_combined = {f"player_{i}": [] for i in range(4)}
+        # 名次分布统计（每位玩家）
+        rank_counts = {f"player_{i}": {1: 0, 2: 0, 3: 0, 4: 0} for i in range(4)}
+        # 每局总分校验
+        score_sums = []
+        # 东家出现次数统计
+        east_counts = {f"player_{i}": 0 for i in range(4)}
+
+        def _seat_priority(w):
+            # 将座风转换为优先级：E(0) < S(1) < W(2) < N(3)
+            if isinstance(w, str):
+                m = {
+                    "E": 0, "S": 1, "W": 2, "N": 3,
+                    "东": 0, "南": 1, "西": 2, "北": 3,
+                    "east": 0, "south": 1, "west": 2, "north": 3,
+                }
+                return m.get(w, 9)
+            try:
+                wi = int(w)
+                return wi if 0 <= wi <= 3 else 9
+            except Exception:
+                return 9
 
         iterator = (
             tqdm(range(num_episodes), desc="评估中") if verbose else range(num_episodes)
@@ -172,21 +210,30 @@ class MahjongEvaluator:
                             warned_zero_mask = True
                         break
 
-                # 获取动作（确定性路径：直接前向 + 掩码 + argmax，避免分布/对数概率计算开销）
-                torch_obs = self._numpy_obs_to_torch(obs)
-                torch_action_mask = (
-                    torch.from_numpy(action_mask).unsqueeze(0).to(self.device)
-                )
-
-                with torch.no_grad():
-                    logits, _value = self.model.forward(torch_obs)
-                    logits = torch.nan_to_num(logits, nan=0.0, posinf=1e9, neginf=-1e9)
-                    logits = logits.clamp(min=-50.0, max=50.0)
-                    masked_logits = logits.masked_fill(torch_action_mask == 0, -1e9)
-                    action = masked_logits.argmax(dim=-1)
+                # 为 player_0 使用模型；其他玩家使用随机合法动作
+                if current_agent == "player_0":
+                    # 获取动作（确定性路径：直接前向 + 掩码 + argmax）
+                    torch_obs = self._numpy_obs_to_torch(obs)
+                    torch_action_mask = (
+                        torch.from_numpy(action_mask).unsqueeze(0).to(self.device)
+                    )
+                    with torch.no_grad():
+                        logits, _value = self.model.forward(torch_obs)
+                        logits = torch.nan_to_num(logits, nan=0.0, posinf=1e9, neginf=-1e9)
+                        logits = logits.clamp(min=-50.0, max=50.0)
+                        masked_logits = logits.masked_fill(torch_action_mask == 0, -1e9)
+                        action_t = masked_logits.argmax(dim=-1)
+                    action_int = int(action_t.cpu().item())
+                else:
+                    legal = np.where(np.asarray(action_mask) > 0)[0]
+                    if legal.size == 0:
+                        # 极端保护：无合法动作则选择0
+                        action_int = 0
+                    else:
+                        action_int = int(np.random.choice(legal))
 
                 # 执行动作
-                self.env.step(action.cpu().item())
+                self.env.step(action_int)
 
                 # 累计奖励
                 for agent in self.env.possible_agents:
@@ -218,8 +265,17 @@ class MahjongEvaluator:
 
             # 计算该局马点（基于终局分与排名）
             scores_now = [self.env.game_state.players[i].score for i in range(4)]
-            # 排名（高分排前）
-            order = sorted(range(4), key=lambda x: scores_now[x], reverse=True)
+            # 座风优先级（用于同分破平）
+            seat_pri = [_seat_priority(self.env.game_state.players[i].seat_wind) for i in range(4)]
+            # 东家统计
+            for i in range(4):
+                if seat_pri[i] == 0:
+                    east_counts[f"player_{i}"] += 1
+            # 排名：先比分数降序，同分按东南西北
+            order = sorted(range(4), key=lambda x: (-scores_now[x], seat_pri[x]))
+            # 名次分布统计
+            for r, pid in enumerate(order, start=1):
+                rank_counts[f"player_{pid}"][r] += 1
             # 分差换算千点
             diff_k = [(s - base_points) / 1000.0 for s in scores_now]
             # 分配uma
@@ -227,8 +283,14 @@ class MahjongEvaluator:
             # oka 分配（此处默认0，若设置>0通常全部给第一名，按需更改）
             rank_to_oka = {order[0]: oka, order[1]: 0, order[2]: 0, order[3]: 0}
             for pid in range(4):
-                uma_value = diff_k[pid] + rank_to_uma[pid] + rank_to_oka[pid]
-                player_uma[f"player_{pid}"].append(uma_value)
+                # 纯Uma(排名)：不叠加分差/oka
+                uma_rank = rank_to_uma[pid]
+                # 合成马点(分差+Uma+Oka)
+                uma_combined = diff_k[pid] + rank_to_uma[pid] + rank_to_oka[pid]
+                player_uma_rank[f"player_{pid}"].append(uma_rank)
+                player_uma_combined[f"player_{pid}"].append(uma_combined)
+            # 记录总分和（用于校验是否恒等于 4*base_points）
+            score_sums.append(sum(scores_now))
 
         # 计算统计结果
         results = {
@@ -244,12 +306,125 @@ class MahjongEvaluator:
             results[prefix + "std_reward"] = np.std(episode_rewards[agent])
             results[prefix + "mean_score"] = np.mean(final_scores[agent])
             results[prefix + "std_score"] = np.std(final_scores[agent])
-            # 追加马点统计
-            results[prefix + "mean_uma"] = np.mean(player_uma[agent])
-            results[prefix + "std_uma"] = np.std(player_uma[agent])
-        # player_0（主要评估对象）的综合性能（以马点为主）
-        results["player_0_performance"] = results["player_0_mean_uma"]
+            # 追加马点统计：纯Uma(排名) 与 合成马点(分差+Uma)
+            results[prefix + "mean_uma_rank"] = np.mean(player_uma_rank[agent])
+            results[prefix + "std_uma_rank"] = np.std(player_uma_rank[agent])
+            results[prefix + "mean_uma_combined"] = np.mean(player_uma_combined[agent])
+            results[prefix + "std_uma_combined"] = np.std(player_uma_combined[agent])
+            # 兼容字段：mean_uma 默认为合成马点
+            results[prefix + "mean_uma"] = results[prefix + "mean_uma_combined"]
+            results[prefix + "std_uma"] = results[prefix + "std_uma_combined"]
+            # 名次分布
+            rc = rank_counts[agent]
+            total = sum(rc.values()) if sum(rc.values()) > 0 else 1
+            results[prefix + "rank1_rate"] = rc[1] / total
+            results[prefix + "rank2_rate"] = rc[2] / total
+            results[prefix + "rank3_rate"] = rc[3] / total
+            results[prefix + "rank4_rate"] = rc[4] / total
+            # 东家占比
+            results[prefix + "east_rate"] = east_counts[agent] / max(1, num_episodes)
 
+        # 总分和校验
+        score_sums_arr = np.array(score_sums, dtype=np.float64)
+        # 考虑立直棒：每棒1000点暂留在场上；理想情况下总分=4*25000 - 1000*riichi_sticks
+        try:
+            sticks = float(getattr(self.env.game_state, 'riichi_sticks', 0))
+        except Exception:
+            sticks = 0.0
+        target_sum = base_points * 4 - 1000.0 * sticks
+        results["score_sum_mean"] = float(score_sums_arr.mean()) if score_sums_arr.size else 0.0
+        results["score_sum_std"] = float(score_sums_arr.std()) if score_sums_arr.size else 0.0
+        results["score_sum_ok_rate"] = float(np.mean(score_sums_arr == target_sum)) if score_sums_arr.size else 0.0
+
+        # player_0（主要评估对象）的综合性能（以合成马点为主）
+        results["player_0_performance"] = results["player_0_mean_uma_combined"]
+
+        return results
+
+    def evaluate_full_match(self, mode: str = "east", verbose: bool = True) -> Dict[str, float]:
+        """
+        整场评估：东风/半庄。按多局累积分差后一次性计算Uma。
+        说明：当前环境按“单局”重置，这里采用每局得分相对25000的“分差累积”近似整场计分。
+        Args:
+            mode: "east" (东风战，约4局) 或 "hanchan" (半庄，约8局)
+        Returns:
+            包含最终整场分数与Uma的统计
+        """
+        uma_table = [15, 5, -5, -15]
+        base_points = 25000
+        oka = 0
+        # 设定整场局数（不含连庄近似；如需严格连庄需环境支持）
+        total_rounds = 4 if mode == "east" else 8
+        # 累积分差（起始分25000，累计每局相对分差）
+        cum_scores = np.array([base_points] * 4, dtype=np.int64)
+
+        for rnd in range(total_rounds):
+            # 每局独立评估一把并取终局分
+            obs, info = self.env.reset(seed=10000 + rnd)
+            while True:
+                if getattr(self.env, "game_state", None) is not None:
+                    if getattr(self.env.game_state, "phase", None) == "end":
+                        break
+                if self.env.agent_selection is None:
+                    break
+                try:
+                    obs = self.env.observe(self.env.agent_selection)
+                except Exception:
+                    pass
+                action_mask = obs.get("action_mask", None)
+                if action_mask is None or np.asarray(action_mask).sum() <= 0:
+                    break
+                # 确定性行动
+                torch_obs = self._numpy_obs_to_torch(obs)
+                torch_action_mask = (
+                    torch.from_numpy(action_mask).unsqueeze(0).to(self.device)
+                )
+                with torch.no_grad():
+                    logits, _value = self.model.forward(torch_obs)
+                    logits = torch.nan_to_num(logits, nan=0.0, posinf=1e9, neginf=-1e9).clamp(-50.0, 50.0)
+                    action = logits.masked_fill(torch_action_mask == 0, -1e9).argmax(dim=-1)
+                self.env.step(int(action.cpu().item()))
+                if self.env.agent_selection is not None:
+                    try:
+                        obs = self.env.observe(self.env.agent_selection)
+                    except Exception:
+                        pass
+            # 回合结束：获取本局终局分
+            round_scores = [self.env.game_state.players[i].score for i in range(4)]
+            # 累积分差
+            for i in range(4):
+                cum_scores[i] += (round_scores[i] - base_points)
+
+        # 整场Uma（按最终分数排名）
+        # 使用当前局面座风作为同分破平（近似）
+        def _seat_priority(w):
+            if isinstance(w, str):
+                m = {
+                    "E": 0, "S": 1, "W": 2, "N": 3,
+                    "东": 0, "南": 1, "西": 2, "北": 3,
+                    "east": 0, "south": 1, "west": 2, "north": 3,
+                }
+                return m.get(w, 9)
+            try:
+                wi = int(w)
+                return wi if 0 <= wi <= 3 else 9
+            except Exception:
+                return 9
+        seat_pri = [_seat_priority(self.env.game_state.players[i].seat_wind) for i in range(4)]
+        order = sorted(range(4), key=lambda x: (-int(cum_scores[x]), seat_pri[x]))
+        rank_to_uma = {order[r]: uma_table[r] for r in range(4)}
+        rank_to_oka = {order[0]: oka, order[1]: 0, order[2]: 0, order[3]: 0}
+        diff_k_final = [(s - base_points) / 1000.0 for s in cum_scores]
+        uma_rank = [rank_to_uma[i] for i in range(4)]
+        uma_combined = [diff_k_final[i] + rank_to_uma[i] + rank_to_oka[i] for i in range(4)]
+
+        results = {
+            "match_mode": mode,
+            "final_scores": {f"player_{i}": int(cum_scores[i]) for i in range(4)},
+            "uma_rank": {f"player_{i}": float(uma_rank[i]) for i in range(4)},
+            "uma_combined": {f"player_{i}": float(uma_combined[i]) for i in range(4)},
+            "player_0_performance": float(uma_combined[0]),
+        }
         return results
 
     def play_interactive(self, render: bool = True, max_steps: int = 0):
@@ -390,8 +565,20 @@ class MahjongEvaluator:
         results = self.evaluate(num_episodes=num_episodes, verbose=True)
 
         print("\n基准测试结果:")
-        print(f"  player_0 平均马点: {results['player_0_mean_uma']:.2f} 千点")
+        print(f"  player_0 纯Uma(排名): {results['player_0_mean_uma_rank']:.2f} 千点")
+        print(f"  player_0 合成马点(分差+Uma): {results['player_0_mean_uma_combined']:.2f} 千点")
         print(f"  player_0 平均分数: {results['player_0_mean_score']:.1f}")
+        # 追加摘要：名次分布、东家占比与总分校验
+        try:
+            print(
+                f"  player_0 名次分布: 1位={results['player_0_rank1_rate']:.2%}, 2位={results['player_0_rank2_rate']:.2%}, 3位={results['player_0_rank3_rate']:.2%}, 4位={results['player_0_rank4_rate']:.2%}"
+            )
+            print(f"  player_0 东家占比: {results['player_0_east_rate']:.2%}")
+            print(
+                f"  总分和校验: 均值={results['score_sum_mean']:.1f}, 方差={results['score_sum_std']:.1f}, 等于100000比例={results['score_sum_ok_rate']:.2%}"
+            )
+        except Exception:
+            pass
 
         return results
 
@@ -420,20 +607,51 @@ class MahjongEvaluator:
             for i in range(4):
                 agent = f"player_{i}"
                 f.write(f"{agent}:\n")
+                if f"{agent}_mean_reward" in results:
+                    f.write(
+                        f"  平均奖励: {results[f'{agent}_mean_reward']:.3f} ± {results[f'{agent}_std_reward']:.3f}\n"
+                    )
+                if f"{agent}_mean_score" in results:
+                    f.write(
+                        f"  平均分数: {results[f'{agent}_mean_score']:.1f} ± {results[f'{agent}_std_score']:.1f}\n"
+                    )
+                # 纯Uma(排名)
                 f.write(
-                    f"  平均奖励: {results[f'{agent}_mean_reward']:.3f} ± {results[f'{agent}_std_reward']:.3f}\n"
+                    f"  纯Uma(排名): {results[f'{agent}_mean_uma_rank']:.2f} ± {results[f'{agent}_std_uma_rank']:.2f} 千点\n"
                 )
+                # 合成马点(分差+Uma)
                 f.write(
-                    f"  平均分数: {results[f'{agent}_mean_score']:.1f} ± {results[f'{agent}_std_score']:.1f}\n"
+                    f"  合成马点(分差+Uma): {results[f'{agent}_mean_uma_combined']:.2f} ± {results[f'{agent}_std_uma_combined']:.2f} 千点\n"
                 )
-                f.write(f"  胜率: {results[f'{agent}_win_rate']:.2%}\n\n")
+                # 名次分布与东家占比
+                f.write(
+                    f"  名次分布: 1位={results[f'{agent}_rank1_rate']:.2%}, 2位={results[f'{agent}_rank2_rate']:.2%}, 3位={results[f'{agent}_rank3_rate']:.2%}, 4位={results[f'{agent}_rank4_rate']:.2%}\n"
+                )
+                f.write(f"  东家占比: {results[f'{agent}_east_rate']:.2%}\n")
+                # 可选胜率
+                if f"{agent}_win_rate" in results:
+                    f.write(f"  胜率: {results[f'{agent}_win_rate']:.2%}\n")
+                f.write("\n")
 
+            # 可选的胜利类型统计（若存在）
+            has_types = any(k in results for k in ("ron_rate", "tsumo_rate", "draw_rate"))
+            if has_types:
+                f.write("=" * 80 + "\n")
+                f.write("胜利类型统计:\n")
+                f.write("=" * 80 + "\n\n")
+                if "ron_rate" in results:
+                    f.write(f"荣和率: {results['ron_rate']:.2%}\n")
+                if "tsumo_rate" in results:
+                    f.write(f"自摸率: {results['tsumo_rate']:.2%}\n")
+                if "draw_rate" in results:
+                    f.write(f"流局率: {results['draw_rate']:.2%}\n")
+            # 总分和校验
             f.write("=" * 80 + "\n")
-            f.write("胜利类型统计:\n")
+            f.write("总分和校验:\n")
             f.write("=" * 80 + "\n\n")
-            f.write(f"荣和率: {results['ron_rate']:.2%}\n")
-            f.write(f"自摸率: {results['tsumo_rate']:.2%}\n")
-            f.write(f"流局率: {results['draw_rate']:.2%}\n")
+            f.write(
+                f"均值: {results['score_sum_mean']:.1f}  方差: {results['score_sum_std']:.1f}  等于100000比例: {results['score_sum_ok_rate']:.2%}\n"
+            )
 
         print(f"\n评估报告已保存至: {output_path}")
 
@@ -444,12 +662,14 @@ def main():
 
     parser = argparse.ArgumentParser(description="评估麻将AI")
     parser.add_argument("--model", type=str, required=True, help="模型路径")
-    parser.add_argument("--episodes", type=int, default=100, help="评估局数")
+    # 支持 --episodes 与 --episode 两个别名
+    parser.add_argument("--episodes", "--episode", type=int, default=100, help="评估局数")
     parser.add_argument("--device", type=str, default="cuda", help="设备")
     parser.add_argument("--interactive", action="store_true", help="交互式演示")
     parser.add_argument(
         "--output", type=str, default="evaluation_report.txt", help="报告输出路径"
     )
+    parser.add_argument("--full-match", choices=["east", "hanchan"], default=None, help="整场评估模式：east(东风)/hanchan(半庄)")
 
     args = parser.parse_args()
 
@@ -459,6 +679,14 @@ def main():
     if args.interactive:
         # 交互式演示
         evaluator.play_interactive(render=True)
+    elif args.full_match is not None:
+        # 整场评估
+        res = evaluator.evaluate_full_match(mode=args.full_match, verbose=True)
+        print("\n整场评估结果:")
+        print(f"  模式: {res['match_mode']}")
+        print(f"  最终分数: {res['final_scores']}")
+        print(f"  纯Uma(排名): {res['uma_rank']}")
+        print(f"  合成马点(分差+Uma): {res['uma_combined']}")
     else:
         # 标准评估
         results = evaluator.benchmark_vs_random(num_episodes=args.episodes)

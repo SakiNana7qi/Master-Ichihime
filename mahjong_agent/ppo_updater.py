@@ -79,15 +79,30 @@ class PPOUpdater:
             * num_batches_per_epoch,
         )
 
+        # 计算学习率下限
+        min_lr = None
+        if getattr(self.config, "min_learning_rate", None) is not None:
+            min_lr = float(self.config.min_learning_rate)
+        else:
+            ratio = float(getattr(self.config, "min_lr_ratio", 0.0) or 0.0)
+            if ratio > 0.0:
+                min_lr = float(self.config.learning_rate) * ratio
+        if min_lr is None or min_lr <= 0.0:
+            min_lr = 1e-8  # 保底
+
+        base_lr = float(self.config.learning_rate)
+
         if self.config.lr_schedule == "linear":
-            # 线性从1降到0，并钳制为非负，避免学习率变成负数
-            return optim.lr_scheduler.LambdaLR(
-                self.optimizer, lr_lambda=lambda step: max(0.0, 1.0 - step / total_opt_steps)
-            )
+            # 线性从1降到 min_lr/base_lr，并钳制为非负
+            def lr_lambda(step: int) -> float:
+                frac = max(0.0, 1.0 - step / total_opt_steps)
+                lr = base_lr * frac
+                return max(min_lr / base_lr, lr / base_lr)
+            return optim.lr_scheduler.LambdaLR(self.optimizer, lr_lambda=lr_lambda)
         elif self.config.lr_schedule == "cosine":
-            return optim.lr_scheduler.CosineAnnealingLR(
-                self.optimizer, T_max=total_opt_steps
-            )
+            # 余弦退火到底为 min_lr
+            cos = optim.lr_scheduler.CosineAnnealingLR(self.optimizer, T_max=total_opt_steps, eta_min=min_lr)
+            return cos
         else:
             raise ValueError(f"未知的学习率调度: {self.config.lr_schedule}")
 

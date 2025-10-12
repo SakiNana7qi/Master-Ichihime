@@ -41,6 +41,9 @@ class PPOConfig:
     # 学习率
     learning_rate: float = 3e-4  # 初始学习率
     lr_schedule: Literal["constant", "linear", "cosine"] = "linear"  # 学习率调度
+    # 学习率下限（避免收敛到0）。若同时设置，以 min_learning_rate 优先；否则按比例 * learning_rate。
+    min_lr_ratio: float = 0.1  # 最低为初始学习率的该比例（例如0.1=10%）
+    min_learning_rate: Optional[float] = None  # 绝对下限（None表示不使用绝对值）
 
     # PPO核心参数
     gamma: float = 0.99  # 折扣因子
@@ -65,7 +68,7 @@ class PPOConfig:
     num_envs: int = 1  # 并行环境数（暂时设为1，后续可扩展）
 
     # 训练总步数
-    total_timesteps: int = 100_000_000  # 总训练步数（扩大10倍）
+    total_timesteps: int = 1_000_000_000  # 总训练步数（扩大10倍）
     log_interval: int = 10  # 日志记录间隔（多少次rollout）
     save_interval: int = 50  # 模型保存间隔（多少次rollout）
     eval_interval: int = 20  # 评估间隔（多少次rollout）
@@ -107,6 +110,11 @@ class PPOConfig:
         assert self.learning_rate > 0, "learning_rate必须大于0"
         assert self.rollout_steps > 0, "rollout_steps必须大于0"
         assert self.mini_batch_size > 0, "mini_batch_size必须大于0"
+        # 学习率下限校验
+        if self.min_learning_rate is not None:
+            assert 0 < self.min_learning_rate <= self.learning_rate, "min_learning_rate 必须在 (0, learning_rate]"
+        if self.min_lr_ratio is not None:
+            assert 0.0 < self.min_lr_ratio <= 1.0, "min_lr_ratio 必须在 (0, 1]"
         # 在并行环境下，应确保 (rollout_steps * num_envs) 能被 mini_batch_size 整除
         effective_envs = max(1, getattr(self, "num_envs", 1))
         assert (

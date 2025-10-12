@@ -423,9 +423,11 @@ class MahjongTrainer:
         # 预计迭代次数需要考虑并行环境数：每次rollout实际收集 rollout_steps * num_envs 的样本
         effective_envs = max(1, getattr(self.config, "num_envs", 1))
         total_updates = max(1, self.config.total_timesteps // (self.config.rollout_steps * effective_envs))
+        # 从 checkpoint 续训时，设置进度条起始更新数
+        start_update = int(self.global_step // max(1, (self.config.rollout_steps * effective_envs)))
         print(f"总步数: {self.config.total_timesteps:,}")
         print(f"Rollout步数: {self.config.rollout_steps} (并行环境: {effective_envs})")
-        print(f"预计迭代次数: {total_updates}")
+        print(f"预计迭代次数: {total_updates} (起始进度: {start_update}/{total_updates})")
         print("=" * 80 + "\n")
 
         # 记录会话起始步数（用于正确计算FPS，避免从checkpoint恢复导致虚高）
@@ -433,7 +435,7 @@ class MahjongTrainer:
         start_time = time.time()
 
         # 主训练循环（带进度条）
-        with tqdm(total=total_updates, desc="Training", unit="update") as pbar:
+        with tqdm(total=total_updates, desc="Training", unit="update", initial=start_update) as pbar:
             while self.global_step < self.config.total_timesteps:
                 self.rollout_count += 1
 
@@ -477,6 +479,17 @@ class MahjongTrainer:
         self.save_checkpoint("final_model.pt")
         print("[OK] Final model saved")
 
+        # 优雅关闭并行环境，避免Windows下BrokenPipe/EOFError
+        try:
+            if self.vec_env is not None:
+                self.vec_env.close()
+        except Exception:
+            pass
+
+        try:
+            self.writer.flush()
+        except Exception:
+            pass
         self.writer.close()
 
     def _log_stats(self, stats: Dict[str, float], start_time: float):
@@ -501,6 +514,11 @@ class MahjongTrainer:
         for key, value in stats.items():
             self.writer.add_scalar(f"train/{key}", value, self.global_step)
         self.writer.add_scalar("train/fps", fps, self.global_step)
+        # 主动flush，提升TensorBoard可见性
+        try:
+            self.writer.flush()
+        except Exception:
+            pass
 
         # 写入实时JSONL供GUI读取
         payload = {
@@ -530,9 +548,20 @@ class MahjongTrainer:
             print(f"  平均回报: {stats.get('mean_reward', 0):.3f}")
             print(f"  平均长度: {stats.get('mean_length', 0):.1f}")
             print(f"  胜率: {stats.get('win_rate', 0):.2%}")
+            if 'player_0_mean_uma' in stats:
+                print(f"  player_0 合成马点: {stats['player_0_mean_uma']:.2f} 千点")
 
+        # 仅写入 player_0 相关与少量通用指标
+        allow_prefixes = ("player_0_",)
+        allow_keys = {"mean_length", "win_rate", "player_0_performance"}
         for key, value in stats.items():
-            self.writer.add_scalar(f"eval/{key}", value, self.global_step)
+            if key in allow_keys or key.startswith(allow_prefixes):
+                self.writer.add_scalar(f"eval/{key}", value, self.global_step)
+        # 主动flush，确保performance等评估指标及时写入
+        try:
+            self.writer.flush()
+        except Exception:
+            pass
 
         # 写入实时JSONL供GUI读取
         payload = {
@@ -570,6 +599,12 @@ class MahjongTrainer:
         episode_rewards = []
         episode_lengths = []
         wins = 0
+        # 追加：记录终局分与Uma
+        final_scores = {f"player_{i}": [] for i in range(4)}
+        uma_table = [15, 5, -5, -15]
+        base_points = 25000
+        oka = 0
+        player_uma = {f"player_{i}": [] for i in range(4)}
 
         for _ in range(num_episodes):
             # 每局使用不同的随机种子，确保庄位/座位随机
@@ -591,18 +626,24 @@ class MahjongTrainer:
                 current_agent = eval_env.agent_selection
                 action_mask = obs["action_mask"]
 
-                # 使用确定性策略
-                torch_obs = self._numpy_obs_to_torch(obs)
-                torch_action_mask = (
-                    torch.from_numpy(action_mask).unsqueeze(0).to(self.device)
-                )
-
-                with torch.no_grad():
-                    action, _, _, _ = self.model.get_action_and_value(
-                        torch_obs, action_mask=torch_action_mask, deterministic=True
+                if current_agent == "player_0":
+                    # 使用模型（确定性）
+                    torch_obs = self._numpy_obs_to_torch(obs)
+                    torch_action_mask = (
+                        torch.from_numpy(action_mask).unsqueeze(0).to(self.device)
                     )
+                    with torch.no_grad():
+                        action, _, _, _ = self.model.get_action_and_value(
+                            torch_obs, action_mask=torch_action_mask, deterministic=True
+                        )
+                    action_int = int(action.cpu().item())
+                else:
+                    # 其余玩家：随机合法动作
+                    import numpy as _np
+                    legal = _np.where(_np.asarray(action_mask) > 0)[0]
+                    action_int = int(legal[_np.random.randint(len(legal))]) if len(legal) > 0 else 0
 
-                eval_env.step(action.cpu().item())
+                eval_env.step(action_int)
 
                 reward = eval_env.rewards.get(current_agent, 0.0)
                 # 累计 player_0 的奖励（不论当前是谁在行动）
@@ -618,15 +659,54 @@ class MahjongTrainer:
             episode_rewards.append(episode_reward)
             episode_lengths.append(episode_length)
 
+            # 记录终局分并计算Uma
+            if getattr(eval_env, "game_state", None) is not None:
+                scores_now = [eval_env.game_state.players[i].score for i in range(4)]
+                for i, agent in enumerate(eval_env.possible_agents):
+                    final_scores[agent].append(scores_now[i])
+                # 同分按座风破平（E>S>W>N）
+                def _seat_priority(w):
+                    if isinstance(w, str):
+                        m = {"E": 0, "S": 1, "W": 2, "N": 3, "东": 0, "南": 1, "西": 2, "北": 3, "east": 0, "south": 1, "west": 2, "north": 3}
+                        return m.get(w, 9)
+                    try:
+                        wi = int(w)
+                        return wi if 0 <= wi <= 3 else 9
+                    except Exception:
+                        return 9
+                seat_pri = [_seat_priority(eval_env.game_state.players[i].seat_wind) for i in range(4)]
+                order = sorted(range(4), key=lambda x: (-scores_now[x], seat_pri[x]))
+                diff_k = [(s - base_points) / 1000.0 for s in scores_now]
+                rank_to_uma = {order[r]: uma_table[r] for r in range(4)}
+                rank_to_oka = {order[0]: oka, order[1]: 0, order[2]: 0, order[3]: 0}
+                for pid in range(4):
+                    v = diff_k[pid] + rank_to_uma[pid] + rank_to_oka[pid]
+                    player_uma[f"player_{pid}"].append(v)
+
             # 根据累计奖励判断是否胜利（更稳健，避免最后一步读取为0导致漏计）
             if p0_total_reward > 0:
                 wins += 1
 
-        return {
-            "mean_reward": np.mean(episode_rewards),
-            "mean_length": np.mean(episode_lengths),
-            "win_rate": wins / num_episodes,
+        results: Dict[str, float] = {
+            "mean_reward": float(np.mean(episode_rewards) if episode_rewards else 0.0),
+            "mean_length": float(np.mean(episode_lengths) if episode_lengths else 0.0),
+            "win_rate": float(wins / num_episodes if num_episodes > 0 else 0.0),
         }
+        # 附加各玩家分数/Uma统计
+        if getattr(eval_env, "possible_agents", None):
+            for agent in eval_env.possible_agents:
+                scores_arr = np.array(final_scores.get(agent, []), dtype=np.float32)
+                umas_arr = np.array(player_uma.get(agent, []), dtype=np.float32)
+                if scores_arr.size > 0:
+                    results[f"{agent}_mean_score"] = float(scores_arr.mean())
+                    results[f"{agent}_std_score"] = float(scores_arr.std())
+                if umas_arr.size > 0:
+                    results[f"{agent}_mean_uma"] = float(umas_arr.mean())
+                    results[f"{agent}_std_uma"] = float(umas_arr.std())
+        if "player_0_mean_uma" in results:
+            results["player_0_performance"] = results["player_0_mean_uma"]
+
+        return results
 
     def save_checkpoint(self, filename: str):
         """保存检查点"""
@@ -686,7 +766,8 @@ class MahjongTrainer:
             # 若检查点内包含配置，采用之（保留外部覆盖项）
             loaded_cfg = checkpoint.get("config", None)
             if loaded_cfg is not None:
-                self.config = loaded_cfg
+                # 合并配置：保留当前（含CLI覆盖）的优先级
+                self.config = self._merge_config(loaded_cfg, self.config)
 
             print(f"已加载检查点(完整): {path}")
             print(f"  全局步数: {self.global_step}")
@@ -741,6 +822,9 @@ def main():
     parser.add_argument("--eval-interval", type=int, default=0, help="覆盖配置的eval_interval（>0生效）")
     parser.add_argument("--no-eval", action="store_true", help="训练期间禁用评估")
     parser.add_argument("--cores-per-proc", type=int, default=0, help="每个子进程分配的CPU核心数（0表示自动）")
+    parser.add_argument("--log-interval", type=int, default=0, help="日志记录间隔（以rollout/update为单位，>0生效）")
+    parser.add_argument("--save-interval", type=int, default=0, help="模型保存间隔（以rollout/update为单位，>0生效）")
+    parser.add_argument("--total-timesteps", type=int, default=0, help="覆盖配置的total_timesteps（>0生效）")
 
     args = parser.parse_args()
 
@@ -782,11 +866,17 @@ def main():
         config.mini_batch_size = args.mini_batch_size
     if args.num_epochs and args.num_epochs > 0:
         config.num_epochs = args.num_epochs
+    if args.total_timesteps and args.total_timesteps > 0:
+        config.total_timesteps = args.total_timesteps
     if args.no_eval:
         # 通过设置极大间隔来禁用评估
         config.eval_interval = 10**9
     elif args.eval_interval and args.eval_interval > 0:
         config.eval_interval = args.eval_interval
+    if args.log_interval and args.log_interval > 0:
+        config.log_interval = args.log_interval
+    if args.save_interval and args.save_interval > 0:
+        config.save_interval = args.save_interval
     if args.cores_per_proc and args.cores_per_proc > 0:
         config.cores_per_proc = args.cores_per_proc
 
