@@ -814,13 +814,31 @@ class MahjongEnv:
             self._force_discard(player_id)
             return
 
-        # 创建结算结果
+        # 创建结算结果（保证守恒：按庄/闲身份精确分配，并累加而非覆盖）
         score_deltas = [0, 0, 0, 0]
         score_deltas[player_id] = result.winner_gain
 
+        dealer_id = self.game_state.dealer
+        # 区分庄/闲支付额
+        dealer_payment = 0
+        other_payment = 0
         for payment in result.payments:
-            payer_id = self._get_player_id_from_wind(payment["from"])
-            score_deltas[payer_id] = -payment["amount"]
+            src = str(payment.get("from", ""))
+            amt = int(payment.get("amount", 0))
+            if "庄家" in src:
+                dealer_payment = amt
+            else:
+                # 闲家1/2（金额相同）
+                other_payment = amt
+
+        # 非和牌者的三家进行扣分
+        for pid in range(4):
+            if pid == player_id:
+                continue
+            if pid == dealer_id:
+                score_deltas[pid] -= dealer_payment
+            else:
+                score_deltas[pid] -= other_payment
 
         round_result = RoundResult(
             result_type="tsumo",
@@ -856,11 +874,11 @@ class MahjongEnv:
             self._handle_pass(player_id)
             return
 
-        # 创建结算结果
+        # 创建结算结果（荣和：放铳者全额支付）
         score_deltas = [0, 0, 0, 0]
         loser_id = self.game_state.last_discard_player
         score_deltas[player_id] = result.winner_gain
-        score_deltas[loser_id] = -result.winner_gain
+        score_deltas[loser_id] -= result.winner_gain
 
         round_result = RoundResult(
             result_type="ron",
