@@ -81,6 +81,8 @@ class MahjongEnv:
 
         # 上一次观测的缓存
         self._last_observations: Dict[str, Any] = {}
+        # 稠密奖励：跟踪每位玩家的向听数（用于计算向听变化奖励）
+        self._shanten_cache: Dict[int, int] = {i: 8 for i in range(4)}  # 初始设为最大向听上界
         # 预分配一个动作掩码缓冲，减少频繁分配（备用，不强制使用）
         try:
             from .utils.action_encoder import ActionEncoder as _AE
@@ -182,6 +184,12 @@ class MahjongEnv:
         self.terminations = {agent: False for agent in self.possible_agents}
         self.truncations = {agent: False for agent in self.possible_agents}
         self.infos = {agent: {} for agent in self.possible_agents}
+        # 初始化向听缓存
+        try:
+            self._init_shanten_cache()
+        except Exception:
+            # 容错，保证训练不中断
+            self._shanten_cache = {i: 8 for i in range(4)}
 
         # 设置第一个行动的玩家（庄家）
         self.agent_selection = f"player_{self.game_state.dealer}"
@@ -232,6 +240,12 @@ class MahjongEnv:
                 else:
                     self.game_state.phase = "discard"
                     self.agent_selection = f"player_{cur}"
+
+        # 稠密奖励：按向听变化给即时奖励
+        try:
+            self._apply_shanten_dense_reward()
+        except Exception:
+            pass
 
         # 检查游戏是否结束
         if self.game_state.phase == "end":
@@ -927,10 +941,25 @@ class MahjongEnv:
 
     def _handle_round_end(self):
         """处理一局结束"""
-        # 分配奖励
-        for i, delta in enumerate(self.game_state.round_result.score_deltas):
-            agent = f"player_{i}"
-            self.rewards[agent] = delta / 1000.0  # 归一化奖励
+        # 终局奖励：改为Uma（合成马点：分差/1000 + Uma + Oka），同分按座风(E>S>W>N)破平
+        uma_table = [15, 5, -5, -15]
+        base_points = 25000
+        oka = 0
+
+        scores_now = [p.score for p in self.game_state.players]
+
+        def _seat_priority(w: str) -> int:
+            m = {"east": 0, "south": 1, "west": 2, "north": 3, "E": 0, "S": 1, "W": 2, "N": 3, "东": 0, "南": 1, "西": 2, "北": 3}
+            return m.get(w, 9)
+
+        seat_pri = [_seat_priority(p.seat_wind) for p in self.game_state.players]
+        order = sorted(range(4), key=lambda x: (-scores_now[x], seat_pri[x]))
+        diff_k = [(s - base_points) / 1000.0 for s in scores_now]
+        rank_to_uma = {order[r]: uma_table[r] for r in range(4)}
+        rank_to_oka = {order[0]: oka, order[1]: 0, order[2]: 0, order[3]: 0}
+        for pid in range(4):
+            agent = f"player_{pid}"
+            self.rewards[agent] = diff_k[pid] + rank_to_uma[pid] + rank_to_oka[pid]
 
         # 标记所有智能体终止
         for agent in self.agents:
@@ -990,6 +1019,68 @@ class MahjongEnv:
             "phase_info": np.zeros(3, dtype=np.int8),
             "action_mask": np.zeros(ActionEncoder.NUM_ACTIONS, dtype=np.int8),
         }
+
+    # ===== 向听数稠密奖励相关 =====
+    def _compute_shanten(self, player: PlayerState) -> int:
+        """简化向听数估计：七对子/国士不特判，近似4面子1雀头。返回0..8。"""
+        # 简化近似：34维手牌计数 + open meld 计为已完成面子。
+        counts = np.zeros(34, dtype=np.int32)
+        for t in player.get_all_tiles():
+            idx = player._tile_to_index(t)
+            if idx >= 0:
+                counts[idx] += 1
+
+        completed_sets = sum(1 for m in player.open_melds if m and len(m.tiles) >= 3)
+        pairs = 0
+        meld_like = 0
+
+        # 粗略估计：每组三张计一个面子；三连顺子用贪心近似
+        tmp = counts.copy()
+        # 刻子
+        for i in range(34):
+            k = tmp[i] // 3
+            if k > 0:
+                meld_like += k
+                tmp[i] -= 3 * k
+        # 顺子（仅数牌）
+        for base in (0, 9, 18):
+            for i in range(base, base + 7):
+                m = min(tmp[i], tmp[i + 1], tmp[i + 2])
+                if m > 0:
+                    meld_like += m
+                    tmp[i] -= m
+                    tmp[i + 1] -= m
+                    tmp[i + 2] -= m
+        # 对子
+        for i in range(34):
+            if tmp[i] >= 2:
+                pairs += 1
+
+        total_sets = completed_sets + meld_like
+        need_sets = max(0, 4 - total_sets)
+        need_pair = 0 if pairs > 0 else 1
+        # 近似向听：缺的面子*2（每面子一般差2张）+ 缺雀头（差1）
+        approx_needed_tiles = need_sets * 2 + need_pair
+        # 映射到 0..8 的粗略向听尺度
+        shanten = int(min(8, max(0, approx_needed_tiles)))
+        return shanten
+
+    def _init_shanten_cache(self):
+        self._shanten_cache = {}
+        for i, p in enumerate(self.game_state.players):
+            self._shanten_cache[i] = self._compute_shanten(p)
+
+    def _apply_shanten_dense_reward(self, reward_scale: float = 0.05, penalty_scale: float = 0.05):
+        """根据每位玩家向听数变化给予稠密奖励。减小->奖励，增大->惩罚，不变->0。"""
+        for i, p in enumerate(self.game_state.players):
+            prev = self._shanten_cache.get(i, 8)
+            cur = self._compute_shanten(p)
+            self._shanten_cache[i] = cur
+            delta = prev - cur
+            if delta > 0:
+                self.rewards[f"player_{i}"] += reward_scale * float(delta)
+            elif delta < 0:
+                self.rewards[f"player_{i}"] -= penalty_scale * float(-delta)
 
     def last(self) -> Tuple[Dict, float, bool, bool, Dict]:
         """

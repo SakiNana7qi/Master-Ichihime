@@ -222,11 +222,15 @@ class MahjongActorCritic(nn.Module):
         self.actor = nn.Sequential(
             nn.Linear(config.hidden_dim, config.hidden_dim),
             self._get_activation(config.activation),
+            nn.Linear(config.hidden_dim, config.hidden_dim),
+            self._get_activation(config.activation),
             nn.Linear(config.hidden_dim, config.action_dim),
         )
 
         # Critic头（价值网络）
         self.critic = nn.Sequential(
+            nn.Linear(config.hidden_dim, config.hidden_dim),
+            self._get_activation(config.activation),
             nn.Linear(config.hidden_dim, config.hidden_dim),
             self._get_activation(config.activation),
             nn.Linear(config.hidden_dim, 1),

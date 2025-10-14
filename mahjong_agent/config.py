@@ -24,16 +24,16 @@ class PPOConfig:
     # 网络架构参数
     # ========================
     # Encoder
-    hidden_dim: int = 512  # 隐藏层维度
-    num_hidden_layers: int = 3  # MLP隐藏层数量
+    hidden_dim: int = 768  # 隐藏层维度（增大模型）
+    num_hidden_layers: int = 4  # MLP隐藏层数量（增大深度）
     activation: Literal["relu", "gelu", "tanh"] = "gelu"  # 激活函数
     use_layer_norm: bool = True  # 是否使用LayerNorm
     dropout: float = 0.0  # Dropout率（训练时）
 
     # Transformer (可选，高级特征提取)
-    use_transformer: bool = False  # 是否使用Transformer
-    num_transformer_layers: int = 2  # Transformer层数
-    num_attention_heads: int = 8  # 注意力头数
+    use_transformer: bool = True  # 是否使用Transformer（默认开启）
+    num_transformer_layers: int = 4  # Transformer层数（增大）
+    num_attention_heads: int = 12  # 注意力头数（与768维匹配）
 
     # ========================
     # PPO算法参数

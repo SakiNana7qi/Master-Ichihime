@@ -8,13 +8,20 @@
 import os
 import multiprocessing as mp
 import platform
-from typing import List, Tuple, Optional, Dict, Any
+from typing import List, Tuple, Optional, Dict, Any, TYPE_CHECKING
 
 import numpy as np
 try:
     from multiprocessing.shared_memory import SharedMemory
 except Exception:
     SharedMemory = None  # 兼容性保护
+
+# 仅用于类型标注的共享内存类型别名，避免运行时变量用于类型表达式
+if TYPE_CHECKING:
+    from multiprocessing.shared_memory import SharedMemory as SharedMemoryT
+else:
+    class SharedMemoryT:  # type: ignore
+        pass
 
 
 def _env_worker(remote, parent_remote, seed: Optional[int], use_shm: bool,
@@ -167,8 +174,8 @@ class SubprocVecEnv:
         self.action_dim = 112
         self.i8_size = 34 + 34 + 136 + 136 + 4 + 170 + 3 + self.action_dim
         self.f32_size = 4 + 5
-        self.shm_i8: List[SharedMemory] = []
-        self.shm_f32: List[SharedMemory] = []
+        self.shm_i8: List[SharedMemoryT] = []
+        self.shm_f32: List[SharedMemoryT] = []
         self._i8_views: List[np.ndarray] = []
         self._f32_views: List[np.ndarray] = []
 
