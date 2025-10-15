@@ -123,6 +123,10 @@ class MahjongEvaluator:
         episode_rewards = {f"player_{i}": [] for i in range(4)}
         episode_lengths = []
         final_scores = {f"player_{i}": [] for i in range(4)}
+        # 胜负类型统计
+        ron_count = 0
+        tsumo_count = 0
+        draw_count = 0
         # 马点（uma）结果：默认使用四人场 [15, 5, -5, -15]，单位千点
         uma_table = [15, 5, -5, -15]
         base_points = 25000  # 起始分
@@ -158,6 +162,11 @@ class MahjongEvaluator:
 
         for episode in iterator:
             obs, info = self.env.reset(seed=episode)
+            try:
+                # 评估/交互关闭近似掩码，启用精确合法性（允许吃碰杠/响应）
+                self.env.game_state.fast_mask = False
+            except Exception:
+                pass
             episode_length = 0
             episode_reward_acc = {f"player_{i}": 0.0 for i in range(4)}
 
@@ -292,6 +301,19 @@ class MahjongEvaluator:
             # 记录总分和（用于校验是否恒等于 4*base_points）
             score_sums.append(sum(scores_now))
 
+            # 记录胜负类型
+            try:
+                rr = self.env.game_state.round_result
+                if rr is not None:
+                    if rr.result_type == "ron":
+                        ron_count += 1
+                    elif rr.result_type == "tsumo":
+                        tsumo_count += 1
+                    elif rr.result_type in ("draw", "abort"):
+                        draw_count += 1
+            except Exception:
+                pass
+
         # 计算统计结果
         results = {
             "num_episodes": num_episodes,
@@ -338,6 +360,12 @@ class MahjongEvaluator:
 
         # player_0（主要评估对象）的综合性能（以合成马点为主）
         results["player_0_performance"] = results["player_0_mean_uma_combined"]
+
+        # 胜负类型比例
+        total_eps = max(1, num_episodes)
+        results["ron_rate"] = ron_count / total_eps
+        results["tsumo_rate"] = tsumo_count / total_eps
+        results["draw_rate"] = draw_count / total_eps
 
         return results
 
@@ -439,6 +467,10 @@ class MahjongEvaluator:
         print("=" * 80 + "\n")
 
         obs, info = self.env.reset()
+        try:
+            self.env.game_state.fast_mask = False
+        except Exception:
+            pass
         step = 0
 
         warned_zero_mask = False
@@ -550,6 +582,16 @@ class MahjongEvaluator:
             player = self.env.game_state.players[i]
             reward = self.env.rewards[agent]
             print(f"  {agent}: {player.score} 点 (奖励: {reward:+.2f})")
+
+        # 若有役种信息，打印役种
+        try:
+            rr = getattr(self.env.game_state, 'round_result', None)
+            if rr is not None and getattr(rr, 'yaku_names', None):
+                print("\n役种:")
+                for name in rr.yaku_names:
+                    print(f"  - {name}")
+        except Exception:
+            pass
 
     def benchmark_vs_random(self, num_episodes: int = 100) -> Dict[str, float]:
         """

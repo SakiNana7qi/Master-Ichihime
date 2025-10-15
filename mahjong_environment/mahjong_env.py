@@ -16,6 +16,7 @@ from .utils.tile_utils import format_hand, tile_to_unicode
 from .utils.meld_helper import MeldHelper
 from mahjong_scorer.main_scorer import MainScorer
 from mahjong_scorer.utils.structures import HandInfo, GameState as ScorerGameState
+from .shanten_ukeire import compute_shanten_and_ukeire
 
 try:
     from .fastops import FASTOPS_AVAILABLE, build_observation_i8_f32
@@ -83,6 +84,13 @@ class MahjongEnv:
         self._last_observations: Dict[str, Any] = {}
         # 稠密奖励：跟踪每位玩家的向听数（用于计算向听变化奖励）
         self._shanten_cache: Dict[int, int] = {i: 8 for i in range(4)}  # 初始设为最大向听上界
+        # ukeire 缓存（牌种类数）
+        self._ukeire_cache: Dict[int, int] = {i: 0 for i in range(4)}
+        # 稠密奖励与观测设置（默认值，可在上层按需覆盖）
+        self.dense_shanten_coef: float = 0.01
+        self.dense_ukeire_coef: float = 0.002
+        self.use_ukeire_reward: bool = True
+        self.add_shanten_ukeire_to_obs: bool = True
         # 预分配一个动作掩码缓冲，减少频繁分配（备用，不强制使用）
         try:
             from .utils.action_encoder import ActionEncoder as _AE
@@ -241,9 +249,11 @@ class MahjongEnv:
                     self.game_state.phase = "discard"
                     self.agent_selection = f"player_{cur}"
 
-        # 稠密奖励：按向听变化给即时奖励
+        # 稠密奖励：按向听/ukeire变化给即时奖励
         try:
             self._apply_shanten_dense_reward()
+            if self.use_ukeire_reward:
+                self._apply_ukeire_dense_reward()
         except Exception:
             pass
 
@@ -361,9 +371,22 @@ class MahjongEnv:
             foff = 0
             obs["scores"] = f32[foff:foff+4]; foff += 4
             obs["game_info"] = f32[foff:foff+5]; foff += 5
+            # 可选：附加 shanten / ukeire 特征
+            if self.add_shanten_ukeire_to_obs:
+                try:
+                    counts = hand.astype(np.int32).copy()
+                    if player.drawn_tile:
+                        di = player._tile_to_index(player.drawn_tile)
+                        if di != -1:
+                            counts[di] = min(4, int(counts[di]) + 1)
+                    sh, uk = compute_shanten_and_ukeire(counts)
+                    obs["shanten"] = np.array([float(sh)], dtype=np.float32)
+                    obs["ukeire"] = np.array([float(uk)], dtype=np.float32)
+                except Exception:
+                    pass
             return obs
         else:
-            return {
+            obs = {
                 "hand": hand,
                 "drawn_tile": drawn_tile_vec,
                 "rivers": rivers,
@@ -375,6 +398,20 @@ class MahjongEnv:
                 "phase_info": phase_info,
                 "action_mask": mask,
             }
+            # 可选：附加 shanten / ukeire 特征
+            if self.add_shanten_ukeire_to_obs:
+                try:
+                    counts = hand.astype(np.int32).copy()
+                    if player.drawn_tile:
+                        di = player._tile_to_index(player.drawn_tile)
+                        if di != -1:
+                            counts[di] = min(4, int(counts[di]) + 1)
+                    sh, uk = compute_shanten_and_ukeire(counts)
+                    obs["shanten"] = np.array([float(sh)], dtype=np.float32)
+                    obs["ukeire"] = np.array([float(uk)], dtype=np.float32)
+                except Exception:
+                    pass
+        return obs
 
     def render(self):
         """渲染当前游戏状态"""
@@ -795,11 +832,30 @@ class MahjongEnv:
         """处理自摸和动作"""
         player = self.game_state.players[player_id]
 
-        # 构建HandInfo
+        # 为避免“多1张”导致的错误和牌，这里严格构造计分用的手牌：
+        # 目标：hand_tiles（不含和牌张）长度应为 13 - 3*len(open_melds)
+        # 基于当前隐藏牌 + 摸牌张，移除一张 winning_tile，并截断到期望长度
+        try:
+            concealed = player.get_all_tiles().copy()  # 可能含 drawn_tile
+        except Exception:
+            concealed = player.hand.copy()
+            if player.drawn_tile:
+                concealed.append(player.drawn_tile)
+        winning_tile = player.drawn_tile
+        if winning_tile in concealed:
+            # 只移除一次（不影响对子等其他结构）
+            try:
+                concealed.remove(winning_tile)
+            except ValueError:
+                pass
+        expected_len = max(0, 13 - 3 * len(player.open_melds))
+        if len(concealed) > expected_len:
+            # 截断到期望长度（保守修正，避免15张传入计分器）
+            concealed = concealed[:expected_len]
         hand_info = HandInfo(
-            hand_tiles=player.hand.copy(),
+            hand_tiles=concealed,
             open_melds=player.open_melds.copy(),
-            winning_tile=player.drawn_tile,
+            winning_tile=winning_tile,
             win_type="TSUMO",
         )
 
@@ -847,6 +903,7 @@ class MahjongEnv:
             han=result.han,
             fu=result.fu,
             points=result.winner_gain,
+            yaku_names=[y.name for y in getattr(result, 'yaku_list', [])] if hasattr(result, 'yaku_list') else [],
         )
 
         self.game_state.end_round(round_result)
@@ -855,11 +912,28 @@ class MahjongEnv:
         """处理荣和动作"""
         player = self.game_state.players[player_id]
 
-        # 构建HandInfo
+        # 放铳荣和：被和牌者的 last_discard 为 winning_tile，和牌者手中不应包含该张
+        # 为防止误包含，严格按13张基数构造 concealed 手牌
+        try:
+            concealed = player.get_all_tiles().copy()
+        except Exception:
+            concealed = player.hand.copy()
+            if player.drawn_tile:
+                concealed.append(player.drawn_tile)
+        winning_tile = self.game_state.last_discard
+        # 若误含该张，移除一次
+        if winning_tile in concealed:
+            try:
+                concealed.remove(winning_tile)
+            except ValueError:
+                pass
+        expected_len = max(0, 13 - 3 * len(player.open_melds))
+        if len(concealed) > expected_len:
+            concealed = concealed[:expected_len]
         hand_info = HandInfo(
-            hand_tiles=player.get_all_tiles(),
+            hand_tiles=concealed,
             open_melds=player.open_melds.copy(),
-            winning_tile=self.game_state.last_discard,
+            winning_tile=winning_tile,
             win_type="RON",
         )
 
@@ -888,6 +962,7 @@ class MahjongEnv:
             han=result.han,
             fu=result.fu,
             points=result.winner_gain,
+            yaku_names=[y.name for y in getattr(result, 'yaku_list', [])] if hasattr(result, 'yaku_list') else [],
         )
 
         self.game_state.end_round(round_result)
@@ -1085,20 +1160,50 @@ class MahjongEnv:
 
     def _init_shanten_cache(self):
         self._shanten_cache = {}
+        self._ukeire_cache = {}
         for i, p in enumerate(self.game_state.players):
-            self._shanten_cache[i] = self._compute_shanten(p)
+            # 计算当前完整14张（含摸张）用于shanten/ukeire
+            counts = np.zeros(34, dtype=np.int32)
+            for t in p.get_all_tiles():
+                idx = p._tile_to_index(t)
+                if idx >= 0:
+                    counts[idx] = min(4, int(counts[idx]) + 1)
+            sh, uk = compute_shanten_and_ukeire(counts)
+            self._shanten_cache[i] = int(sh)
+            self._ukeire_cache[i] = int(uk)
 
     def _apply_shanten_dense_reward(self, reward_scale: float = 0.05, penalty_scale: float = 0.05):
         """根据每位玩家向听数变化给予稠密奖励。减小->奖励，增大->惩罚，不变->0。"""
         for i, p in enumerate(self.game_state.players):
             prev = self._shanten_cache.get(i, 8)
-            cur = self._compute_shanten(p)
+            # 用精确计算替代近似
+            counts = np.zeros(34, dtype=np.int32)
+            for t in p.get_all_tiles():
+                idx = p._tile_to_index(t)
+                if idx >= 0:
+                    counts[idx] = min(4, int(counts[idx]) + 1)
+            cur, _uk = compute_shanten_and_ukeire(counts)
             self._shanten_cache[i] = cur
             delta = prev - cur
             if delta > 0:
-                self.rewards[f"player_{i}"] += reward_scale * float(delta)
+                self.rewards[f"player_{i}"] += self.dense_shanten_coef * float(delta)
             elif delta < 0:
-                self.rewards[f"player_{i}"] -= penalty_scale * float(-delta)
+                self.rewards[f"player_{i}"] -= self.dense_shanten_coef * float(-delta)
+
+    def _apply_ukeire_dense_reward(self):
+        """根据每位玩家 ukeire（有效进张种类数）变化给予微弱奖励。"""
+        for i, p in enumerate(self.game_state.players):
+            prev = self._ukeire_cache.get(i, 0)
+            counts = np.zeros(34, dtype=np.int32)
+            for t in p.get_all_tiles():
+                idx = p._tile_to_index(t)
+                if idx >= 0:
+                    counts[idx] = min(4, int(counts[idx]) + 1)
+            _sh, uk = compute_shanten_and_ukeire(counts)
+            self._ukeire_cache[i] = int(uk)
+            delta = int(uk) - int(prev)
+            if delta != 0:
+                self.rewards[f"player_{i}"] += self.dense_ukeire_coef * float(delta) / 34.0
 
     def last(self) -> Tuple[Dict, float, bool, bool, Dict]:
         """

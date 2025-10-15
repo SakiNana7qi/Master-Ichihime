@@ -24,6 +24,8 @@ class RoundResult:
     han: int = 0
     fu: int = 0
     points: int = 0
+    # 役种名称列表（用于评估/交互输出）
+    yaku_names: List[str] = field(default_factory=list)
 
 
 class GameState:
@@ -328,19 +330,16 @@ class GameState:
         for i, delta in enumerate(result.score_deltas):
             self.players[i].score += delta
 
-        # 更新庄家和本场数
+        # 更新庄家和本场数（基本规则）：
+        # 和了：庄家和则连庄(+1本场)；闲家和则庄移转，本场清零
+        # 流局：按听牌连庄；此处暂保守为连庄(+1)
         if result.result_type in ["ron", "tsumo"]:
-            # 有人和牌
             if result.winner == self.dealer:
-                # 庄家和牌，连庄
                 self.honba += 1
             else:
-                # 闲家和牌，庄家轮换
                 self.dealer = self.next_player(self.dealer)
                 self.honba = 0
         elif result.result_type == "draw":
-            # 流局，庄家听牌则连庄
-            # 这里简化处理：总是连庄（实际需要检查听牌）
             self.honba += 1
 
     def advance_round(self):

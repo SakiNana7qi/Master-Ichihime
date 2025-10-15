@@ -5,6 +5,7 @@
 """
 
 from typing import List, Set, Tuple
+import numpy as np
 import sys
 import os
 
@@ -153,7 +154,7 @@ class LegalActionsHelper:
                     actions.append(action)
 
                 # 如果可以立直，添加立直打牌动作
-                if game_state.can_riichi(
+                if (not player.is_riichi) and game_state.can_riichi(
                     player.player_id
                 ) and self._is_tenpai_after_discard(player, tile):
                     action_riichi = ActionEncoder.encode_discard(tile, with_riichi=True)
@@ -163,54 +164,49 @@ class LegalActionsHelper:
         return actions
 
     def _can_tsumo(self, player: PlayerState, game_state: GameState) -> bool:
-        """判断是否可以自摸和"""
-        # 必须有刚摸到的牌
+        """判断是否可以自摸和：必须形完且有役。"""
         if not player.drawn_tile:
             return False
-
-        # 使用算点器判断是否能和牌
         from mahjong_scorer.utils.structures import HandInfo
-
         hand_info = HandInfo(
-            hand_tiles=player.hand.copy(),
+            hand_tiles=player.hand.copy(),  # 不包含摸牌
             open_melds=player.open_melds.copy(),
             winning_tile=player.drawn_tile,
             win_type="TSUMO",
         )
-
-        # 简单检查：是否能组成完整的和牌形
-        from mahjong_scorer.hand_analyzer import HandAnalyzer
-
-        analyzer = HandAnalyzer()
-        result = analyzer.analyze_hand(hand_info)
-
-        return result.is_complete
+        # 严格用算点器判定（包含役种判定），无役则不可和
+        score = self.scorer.calculate_score(hand_info, self._to_scorer_gamestate(player, game_state))
+        return not bool(getattr(score, "error", None))
 
     def _can_ron(self, player: PlayerState, game_state: GameState) -> bool:
-        """判断是否可以荣和"""
+        """判断是否可以荣和：必须形完且有役；振听不可荣和。"""
         if not game_state.last_discard:
             return False
-
-        # 振听检查：如果牌河中有听牌，不能和
         if player.is_furiten:
             return False
-
-        # 使用算点器判断
         from mahjong_scorer.utils.structures import HandInfo
-
         hand_info = HandInfo(
             hand_tiles=player.get_all_tiles(),
             open_melds=player.open_melds.copy(),
             winning_tile=game_state.last_discard,
             win_type="RON",
         )
+        score = self.scorer.calculate_score(hand_info, self._to_scorer_gamestate(player, game_state))
+        return not bool(getattr(score, "error", None))
 
-        from mahjong_scorer.hand_analyzer import HandAnalyzer
-
-        analyzer = HandAnalyzer()
-        result = analyzer.analyze_hand(hand_info)
-
-        return result.is_complete
+    def _to_scorer_gamestate(self, player: PlayerState, game_state: GameState):
+        from mahjong_scorer.utils.structures import GameState as ScGS
+        return ScGS(
+            player_wind=player.seat_wind,
+            prevalent_wind=game_state.round_wind,
+            honba=game_state.honba,
+            kyotaku_sticks=game_state.riichi_sticks,
+            dora_indicators=game_state.dora_indicators.copy(),
+            ura_dora_indicators=game_state.ura_dora_indicators.copy(),
+            is_riichi=player.is_riichi,
+            is_double_riichi=player.is_double_riichi,
+            is_ippatsu=player.is_ippatsu,
+        )
 
     def _can_pon(self, player: PlayerState, game_state: GameState) -> bool:
         """判断是否可以碰"""
